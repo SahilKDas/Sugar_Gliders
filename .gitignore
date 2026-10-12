@@ -6,4 +6,5 @@
 *.log
 .cache/
 *.tmp
+/data/
 

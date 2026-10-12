@@ -18,6 +18,7 @@ struct App {
     draft: String,
     room: String,
     groups: Vec<maple_protocol::Group>,
+    members: Vec<String>,
     scroll: usize,
     cursor: (f64, f64),
     messages: VecDeque<(String, String, String)>,
@@ -66,6 +67,9 @@ impl ApplicationHandler for App {
                 }
                 Event::Error(s) => self.status = s,
                 Event::Groups(groups) => self.groups = groups,
+                Event::Presence { channel, members } if channel == self.room => {
+                    self.members = members
+                }
                 Event::Joined(room) => {
                     self.room = room;
                     self.scroll = 0;
@@ -138,8 +142,7 @@ impl ApplicationHandler for App {
                         match maple_audio::VoiceSession::connect("127.0.0.1:8788") {
                             Ok(v) => {
                                 self.voice = Some(v);
-                                self.status =
-                                    "Voice loopback connected (headphones recommended)".into();
+                                self.status = "Voice connected • local Autumn Lounge".into();
                             }
                             Err(e) => self.status = format!("Voice: {e}"),
                         }
@@ -202,6 +205,7 @@ impl ApplicationHandler for App {
                     self.voice.is_some(),
                     speaking,
                     &self.groups,
+                    &self.members,
                 );
                 let surface = self.surface.as_mut().unwrap();
                 if surface.resize(width, height).is_ok() {
@@ -246,6 +250,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             false,
             false,
             &[],
+            &["Rowan".into(), "You".into()],
         );
         tiny_skia::Pixmap::from_vec(data, tiny_skia::IntSize::from_wh(1100, 760).unwrap())
             .unwrap()
@@ -277,6 +282,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         draft: String::new(),
         room: "general".into(),
         groups: Vec::new(),
+        members: Vec::new(),
         scroll: 0,
         cursor: (0.0, 0.0),
         messages: VecDeque::new(),

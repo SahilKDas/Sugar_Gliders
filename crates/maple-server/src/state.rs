@@ -1,13 +1,86 @@
 use maple_protocol::{valid_label, valid_text, Command, Event, Group};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct State {
     pub groups: BTreeMap<String, Group>,
+    #[serde(skip)]
     pub online: BTreeSet<String>,
     pub history: BTreeMap<String, VecDeque<Event>>,
 }
 pub const CHANNELS: [&str; 3] = ["general", "introductions", "campfire"];
 impl State {
+    pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
+        let path = std::path::Path::new("data/state.json");
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        if path.metadata()?.len() > 64000000 {
+            return Err("State file exceeds 64 MB".into());
+        }
+        let state: Self = serde_json::from_slice(&std::fs::read(path)?)?;
+        if state.groups.len() > 64 || state.history.len() > 67 {
+            return Err("Too many saved chats".into());
+        }
+        for (id, g) in &state.groups {
+            if !valid_label(id)
+                || id != &g.id
+                || !(2..=10).contains(&g.members.len())
+                || g.members.iter().any(|m| !valid_label(m))
+            {
+                return Err("Invalid saved membership".into());
+            }
+        }
+        for (id, history) in &state.history {
+            if history.len() > 100
+                || (!CHANNELS.contains(&id.as_str()) && !state.groups.contains_key(id))
+            {
+                return Err("Invalid saved history".into());
+            }
+            for event in history {
+                match event {
+                    Event::Message {
+                        channel,
+                        author,
+                        text,
+                    } if channel == id && valid_label(author) && valid_text(text) => {}
+                    _ => return Err("Invalid saved message".into()),
+                }
+            }
+        }
+        Ok(state)
+    }
+    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let groups = self
+            .groups
+            .iter()
+            .filter(|(_, g)| g.persistent)
+            .map(|(id, g)| (id.clone(), g.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let history = self
+            .history
+            .iter()
+            .filter(|(id, _)| CHANNELS.contains(&id.as_str()) || groups.contains_key(*id))
+            .map(|(id, h)| (id.clone(), h.clone()))
+            .collect();
+        let snapshot = Self {
+            groups,
+            history,
+            online: BTreeSet::new(),
+        };
+        let bytes = serde_json::to_vec(&snapshot)?;
+        if bytes.len() > 64000000 {
+            return Err("Persistent state exceeds 64 MB".into());
+        }
+        std::fs::create_dir_all("data")?;
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create("data/state.tmp")?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        std::fs::rename("data/state.tmp", "data/state.json")?;
+        Ok(())
+    }
     pub fn allowed(&self, name: &str, channel: &str) -> bool {
         CHANNELS.contains(&channel)
             || self
@@ -23,6 +96,17 @@ impl State {
                 .cloned()
                 .collect(),
         )
+    }
+    pub fn presence(&self, channel: &str) -> Event {
+        let members = self
+            .groups
+            .get(channel)
+            .map(|g| g.members.iter().cloned().collect())
+            .unwrap_or_else(|| self.online.iter().cloned().collect());
+        Event::Presence {
+            channel: channel.into(),
+            members,
+        }
     }
     pub fn apply(
         &mut self,
@@ -62,7 +146,7 @@ impl State {
                 };
                 let history = self.history.entry(channel).or_default();
                 history.push_back(event.clone());
-                if history.len() > 200 {
+                if history.len() > 100 {
                     history.pop_front();
                 }
                 Ok(vec![event])
@@ -108,7 +192,7 @@ impl State {
                 if *room == channel {
                     *room = "general".into();
                 }
-                Ok(vec![])
+                Ok(vec![Event::Joined(room.clone())])
             }
             Command::Close { channel } => {
                 let g = self.groups.get(&channel).ok_or("Unknown chat")?;
@@ -120,7 +204,7 @@ impl State {
                 if *room == channel {
                     *room = "general".into();
                 }
-                Ok(vec![])
+                Ok(vec![Event::Joined(room.clone())])
             }
             Command::Hello { .. } => Err("Already introduced".into()),
         }
@@ -193,6 +277,6 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(s.history["general"].len(), 200);
+        assert_eq!(s.history["general"].len(), 100);
     }
 }

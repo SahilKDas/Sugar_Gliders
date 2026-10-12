@@ -110,6 +110,7 @@ impl Painter {
         voice: bool,
         speaking: bool,
         groups: &[maple_protocol::Group],
+        members: &[String],
     ) -> Vec<u8> {
         let mut p = Pixmap::new(w, h).expect("window pixmap");
         p.fill(Self::color(Theme::CREAM));
@@ -159,11 +160,7 @@ impl Painter {
         );
         self.text(
             &mut p,
-            if voice {
-                "Leave voice"
-            } else {
-                "Join voice test"
-            },
+            if voice { "Leave voice" } else { "Join voice" },
             90.0,
             409.0,
             15.0,
@@ -279,6 +276,23 @@ impl Painter {
             Theme::CRIMSON,
             130.0,
         );
+        self.text(
+            &mut p,
+            &format!("MEMBERS · {}", members.len()),
+            member_x + 15.0,
+            245.0,
+            11.0,
+            0x806352,
+            130.0,
+        );
+        for (i, member) in members.iter().take(10).enumerate() {
+            let y = 279.0 + i as f32 * 31.0;
+            if y > hf - 120.0 {
+                break;
+            }
+            Self::circle(&mut p, member_x + 24.0, y - 4.0, 8.0, Theme::GOLD);
+            self.text(&mut p, member, member_x + 42.0, y, 13.0, Theme::BARK, 100.0);
+        }
         let mut lines = Vec::new();
         for (channel, author, text) in messages {
             if channel == room {
