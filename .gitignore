@@ -1,0 +1,9 @@
+/target/
+**/target/
+*.wav
+*.pcm
+*.raw
+*.log
+.cache/
+*.tmp
+
