@@ -27,6 +27,13 @@ a two-client chat/voice test.
 
 Rounded parchment cards, avatar initials, selected-channel accents, hover feedback,
 blinking carets, and a gently pulsing speaking ring keep the native interface clear.
+Text rasterizes at the display's physical DPI with fractional glyph placement and
+kerning; it is never enlarged as part of a finished screenshot. Oversampled grayscale
+coverage avoids assuming an RGB/BGR panel layout. The composer supports mouse caret
+placement/drag selection, arrows, Shift selection, Ctrl+arrows, Home/End, Ctrl+A,
+Ctrl+C/X/V on Windows, and Unicode grapheme-aware insertion/deletion. Sign-in fields
+support cursor movement, selection, and paste; passwords cannot be copied or cut.
+A real vector caret stays visible while typing, then resumes blinking.
 UI animation pauses when the window loses focus. Warm synthesized chimes distinguish
 sending/receiving messages, sign-in/out, navigation, voice join/leave, errors, and
 sound toggles; typing adds a quiet short wooden tick. Sounds use output-only CPAL,

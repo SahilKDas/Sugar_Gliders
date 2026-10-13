@@ -1085,6 +1085,8 @@ dependencies = [
  "softbuffer",
  "tiny-skia",
  "tokio",
+ "unicode-segmentation",
+ "windows-sys 0.61.2",
  "winit",
  "zeroize",
 ]

@@ -1,5 +1,7 @@
+use crate::editor::Editor;
 use maple_protocol::{Command, Secret};
 pub struct Form {
+    pub edits: [Editor; 2],
     pub username: String,
     pub password: Secret,
     pub field: usize,
@@ -9,6 +11,7 @@ pub struct Form {
 impl Default for Form {
     fn default() -> Self {
         Self {
+            edits: [Editor::default(), Editor::default()],
             username: String::new(),
             password: Secret(String::new()),
             field: 0,
@@ -23,28 +26,52 @@ impl Form {
             return;
         }
         if self.field == 0 {
-            for c in text
+            let filtered: String = text
                 .chars()
                 .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-            {
-                if self.username.len() < 32 {
-                    self.username.push(c.to_ascii_lowercase());
-                }
-            }
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
+            self.edits[0].insert(&mut self.username, &filtered, 32);
         } else {
-            for c in text.chars().filter(|c| !c.is_control()) {
-                if self.password.0.len() + c.len_utf8() <= 256 {
-                    self.password.0.push(c);
-                }
-            }
+            self.edits[1].insert(&mut self.password.0, text, 256);
         }
     }
     pub fn backspace(&mut self) {
-        if self.field == 0 {
-            self.username.pop();
-        } else {
-            self.password.0.pop();
+        self.delete(true);
+    }
+    pub fn delete(&mut self, backward: bool) {
+        if self.pending {
+            return;
         }
+        if self.field == 0 {
+            self.edits[0].delete(&mut self.username, backward);
+        } else {
+            self.edits[1].delete(&mut self.password.0, backward);
+        }
+    }
+    pub fn navigate(&mut self, right: bool, selecting: bool, word: bool) {
+        let text = if self.field == 0 {
+            &self.username
+        } else {
+            &self.password.0
+        };
+        self.edits[self.field].horizontal(text, right, selecting, word);
+    }
+    pub fn edge(&mut self, end: bool, selecting: bool) {
+        let text = if self.field == 0 {
+            &self.username
+        } else {
+            &self.password.0
+        };
+        self.edits[self.field].move_to(text, if end { text.len() } else { 0 }, selecting);
+    }
+    pub fn select_all(&mut self) {
+        let text = if self.field == 0 {
+            &self.username
+        } else {
+            &self.password.0
+        };
+        self.edits[self.field].select_all(text);
     }
     pub fn click(&mut self, x: f64, y: f64, w: f64, h: f64) -> bool {
         let left = w / 2.0 - 250.0;
@@ -70,6 +97,7 @@ impl Form {
         }
         self.pending = true;
         let password = Secret(std::mem::take(&mut self.password.0));
+        self.edits[1].end(&self.password.0);
         Some(if self.register {
             Command::Register {
                 username: self.username.clone(),

@@ -1,5 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 mod auth;
+mod clipboard;
+mod editor;
 mod input;
 mod network;
 mod ui;
@@ -23,6 +25,10 @@ struct App {
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     ui: ui::Painter,
     draft: String,
+    edit: editor::Editor,
+    ime_preedit: bool,
+    dragging_selection: bool,
+    last_typing_sound: std::time::Instant,
     room: String,
     groups: Vec<maple_protocol::Group>,
     members: Vec<String>,
@@ -66,6 +72,10 @@ impl App {
             surface: None,
             ui: ui::Painter::new()?,
             draft: String::new(),
+            edit: editor::Editor::default(),
+            ime_preedit: false,
+            dragging_selection: false,
+            last_typing_sound: std::time::Instant::now(),
             room: "general".into(),
             groups: Vec::new(),
             members: Vec::new(),
@@ -131,6 +141,7 @@ impl App {
                 .insert(self.room.clone(), std::mem::take(&mut self.draft));
             self.draft = self.drafts.remove(&channel).unwrap_or_default();
         }
+        self.edit.end(&self.draft);
         self.room = channel.clone();
         self.scroll = 0;
         self.composer_focused = true;
@@ -161,6 +172,7 @@ impl App {
         };
         if let Command::Join { channel } = command {
             self.draft.clear();
+            self.edit.end(&self.draft);
             self.select_room(channel);
             return;
         }
@@ -168,20 +180,46 @@ impl App {
             Ok(()) => {
                 self.sound(Cue::Send);
                 self.draft.clear();
+                self.edit.end(&self.draft);
                 self.scroll = 0;
             }
             Err(_) => self.status = "Backend busy • draft retained".into(),
         }
     }
-    fn insert_text(&mut self, text: &str) {
-        if !text.is_empty() {
-            self.sound(Cue::Type);
-        }
-        for c in text.chars().filter(|c| !c.is_control()) {
-            if self.draft.len() + c.len_utf8() > maple_protocol::MAX_TEXT {
-                break;
+    fn copy_selection(&mut self, cut: bool) {
+        #[cfg(windows)]
+        if let Some((a, b)) = self.edit.selection() {
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            let owner = self
+                .window
+                .as_ref()
+                .and_then(|w| w.window_handle().ok())
+                .and_then(|h| match h.as_raw() {
+                    RawWindowHandle::Win32(w) => Some(w.hwnd.get() as *mut std::ffi::c_void),
+                    _ => None,
+                });
+            if owner.is_some_and(|owner| clipboard::write(&self.draft[a..b], owner)) && cut {
+                self.edit.delete(&mut self.draft, true);
             }
-            self.draft.push(c);
+        }
+        #[cfg(not(windows))]
+        let _ = cut;
+    }
+    fn input_feedback(&mut self) {
+        self.ui.elapsed.set(self.started.elapsed().as_secs_f32());
+        self.ui
+            .force_caret_until
+            .set(self.started.elapsed().as_secs_f32() + 0.7);
+    }
+    fn insert_text(&mut self, text: &str) {
+        self.edit
+            .insert(&mut self.draft, text, maple_protocol::MAX_TEXT);
+        self.input_feedback();
+        if self.last_typing_sound.elapsed() >= std::time::Duration::from_millis(75) {
+            if let Some(sounds) = &self.sounds {
+                sounds.play(Cue::Type);
+            }
+            self.last_typing_sound = std::time::Instant::now();
         }
     }
     fn sign_in(&mut self) {
@@ -256,6 +294,7 @@ impl ApplicationHandler for App {
                         self.members.clear();
                         self.drafts.clear();
                         self.draft.clear();
+                        self.edit.end(&self.draft);
                     }
                     self.active_user = Some(username.clone());
                     self.sound(Cue::Welcome);
@@ -274,6 +313,7 @@ impl ApplicationHandler for App {
                     self.messages.clear();
                     self.drafts.clear();
                     self.draft.clear();
+                    self.edit.end(&self.draft);
                     self.auth.pending = false;
                     self.status = "Signed out".into();
                 }
@@ -406,12 +446,28 @@ impl ApplicationHandler for App {
                     } else {
                         winit::window::CursorIcon::Default
                     });
+                    if self.dragging_selection && self.authenticated && !self.about {
+                        let caret = self.ui.caret_at(&self.draft, self.cursor.0 as f32 - 296.0);
+                        self.edit.move_to(&self.draft, caret, true);
+                    }
                     self.ui.cursor.set(self.cursor);
                     w.request_redraw();
                 }
             }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => self.dragging_selection = false,
+            WindowEvent::Focused(false) => self.dragging_selection = false,
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::Ime(Ime::Preedit(text, _)) => {
+                self.ime_preedit = !text.is_empty();
+            }
+            WindowEvent::Ime(Ime::Disabled) => self.ime_preedit = false,
             WindowEvent::Ime(Ime::Commit(text)) if !self.about => {
+                self.ime_preedit = false;
+                self.input_feedback();
                 if self.authenticated {
                     if self.composer_focused {
                         self.insert_text(&text)
@@ -509,7 +565,14 @@ impl ApplicationHandler for App {
                             self.select_room(g.id.clone());
                         }
                     }
-                    input::Control::Composer => self.composer_focused = true,
+                    input::Control::Composer => {
+                        self.composer_focused = true;
+                        self.dragging_selection = true;
+                        let caret = self.ui.caret_at(&self.draft, self.cursor.0 as f32 - 296.0);
+                        self.edit
+                            .move_to(&self.draft, caret, self.modifiers.shift_key());
+                        self.input_feedback();
+                    }
                     input::Control::Send => self.submit(),
                     input::Control::None => self.composer_focused = false,
                     input::Control::Voice => {
@@ -527,6 +590,10 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                self.input_feedback();
+                if self.ime_preedit {
+                    return;
+                }
                 if event.logical_key == Key::Named(NamedKey::F3) {
                     self.toggle_sound();
                     if let Some(w) = &self.window {
@@ -539,11 +606,42 @@ impl ApplicationHandler for App {
                     && event.logical_key != Key::Named(NamedKey::F1)
                 {
                     match event.logical_key {
+                        Key::Character(ref s)
+                            if self.modifiers.control_key() && s.eq_ignore_ascii_case("v") =>
+                        {
+                            if let Some(text) = clipboard::read() {
+                                self.auth.insert(&text);
+                            }
+                        }
                         Key::Named(NamedKey::Tab) => self.auth.field = 1 - self.auth.field,
                         Key::Named(NamedKey::Enter) => self.sign_in(),
+                        Key::Named(NamedKey::ArrowLeft) => self.auth.navigate(
+                            false,
+                            self.modifiers.shift_key(),
+                            self.modifiers.control_key(),
+                        ),
+                        Key::Named(NamedKey::ArrowRight) => self.auth.navigate(
+                            true,
+                            self.modifiers.shift_key(),
+                            self.modifiers.control_key(),
+                        ),
+                        Key::Named(NamedKey::Home) => {
+                            self.auth.edge(false, self.modifiers.shift_key())
+                        }
+                        Key::Named(NamedKey::End) => {
+                            self.auth.edge(true, self.modifiers.shift_key())
+                        }
+                        Key::Named(NamedKey::Delete) => self.auth.delete(false),
+                        Key::Character(ref s)
+                            if self.modifiers.control_key() && s.eq_ignore_ascii_case("a") =>
+                        {
+                            self.auth.select_all()
+                        }
                         Key::Named(NamedKey::Backspace) => self.auth.backspace(),
                         Key::Character(s)
-                            if !self.modifiers.control_key() && !self.modifiers.super_key() =>
+                            if !self.ime_preedit
+                                && !self.modifiers.control_key()
+                                && !self.modifiers.super_key() =>
                         {
                             self.auth.insert(event.text.as_deref().unwrap_or(&s))
                         }
@@ -569,12 +667,73 @@ impl ApplicationHandler for App {
                     Key::Named(NamedKey::Enter) => {
                         self.submit();
                     }
-                    Key::Named(NamedKey::Backspace) if self.composer_focused => {
-                        self.draft.pop();
+                    Key::Named(NamedKey::ArrowLeft) if self.composer_focused => {
+                        self.edit.horizontal(
+                            &self.draft,
+                            false,
+                            self.modifiers.shift_key(),
+                            self.modifiers.control_key(),
+                        )
                     }
-                    Key::Named(NamedKey::Escape) => self.draft.clear(),
+                    Key::Named(NamedKey::ArrowRight) if self.composer_focused => {
+                        self.edit.horizontal(
+                            &self.draft,
+                            true,
+                            self.modifiers.shift_key(),
+                            self.modifiers.control_key(),
+                        )
+                    }
+                    Key::Named(NamedKey::Home) if self.composer_focused => {
+                        self.edit
+                            .move_to(&self.draft, 0, self.modifiers.shift_key())
+                    }
+                    Key::Named(NamedKey::End) if self.composer_focused => {
+                        self.edit
+                            .move_to(&self.draft, self.draft.len(), self.modifiers.shift_key())
+                    }
+                    Key::Named(NamedKey::Delete) if self.composer_focused => {
+                        self.edit.delete(&mut self.draft, false)
+                    }
+                    Key::Character(ref s)
+                        if self.composer_focused
+                            && self.modifiers.control_key()
+                            && s.eq_ignore_ascii_case("v") =>
+                    {
+                        if let Some(text) = clipboard::read() {
+                            self.insert_text(&text);
+                        }
+                    }
+                    Key::Character(ref s)
+                        if self.composer_focused
+                            && self.modifiers.control_key()
+                            && s.eq_ignore_ascii_case("c") =>
+                    {
+                        self.copy_selection(false)
+                    }
+                    Key::Character(ref s)
+                        if self.composer_focused
+                            && self.modifiers.control_key()
+                            && s.eq_ignore_ascii_case("x") =>
+                    {
+                        self.copy_selection(true)
+                    }
+                    Key::Character(ref s)
+                        if self.composer_focused
+                            && self.modifiers.control_key()
+                            && s.eq_ignore_ascii_case("a") =>
+                    {
+                        self.edit.select_all(&self.draft)
+                    }
+                    Key::Named(NamedKey::Backspace) if self.composer_focused => {
+                        self.edit.delete(&mut self.draft, true);
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.draft.clear();
+                        self.edit.end(&self.draft);
+                    }
                     Key::Character(s)
                         if self.composer_focused
+                            && !self.ime_preedit
                             && !self.modifiers.control_key()
                             && !self.modifiers.super_key() =>
                     {
@@ -595,6 +754,10 @@ impl ApplicationHandler for App {
                 };
                 let speaking = self.voice.as_ref().is_some_and(|v| v.speaking());
                 let logical = size.to_logical::<u32>(w.scale_factor());
+                self.ui.caret.set(self.edit.caret);
+                self.ui.selection.set(self.edit.selection());
+                self.ui.scale.set(w.scale_factor() as f32);
+                self.ui.pixel_size.set(Some((size.width, size.height)));
                 let mut pixels = self.ui.draw(
                     logical.width,
                     logical.height,
@@ -622,26 +785,6 @@ impl ApplicationHandler for App {
                         &self.auth,
                         &self.status,
                     );
-                }
-                if logical.width != size.width || logical.height != size.height {
-                    let image = tiny_skia::Pixmap::from_vec(
-                        pixels,
-                        tiny_skia::IntSize::from_wh(logical.width, logical.height).unwrap(),
-                    )
-                    .unwrap();
-                    let mut scaled = tiny_skia::Pixmap::new(size.width, size.height).unwrap();
-                    scaled.draw_pixmap(
-                        0,
-                        0,
-                        image.as_ref(),
-                        &tiny_skia::PixmapPaint::default(),
-                        tiny_skia::Transform::from_scale(
-                            size.width as f32 / logical.width as f32,
-                            size.height as f32 / logical.height as f32,
-                        ),
-                        None,
-                    );
-                    pixels = scaled.take();
                 }
                 let surface = self.surface.as_mut().unwrap();
                 if surface.resize(width, height).is_ok() {
@@ -677,6 +820,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|_| std::env::args().nth(2))
     {
         let painter = ui::Painter::new()?;
+        let preview_scale = std::env::args()
+            .nth(3)
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|s| s.is_finite() && (0.5..=4.0).contains(s))
+            .unwrap_or(1.0);
+        painter.scale.set(preview_scale);
         let mut messages = VecDeque::new();
         messages.push_back((
             "general".into(),
@@ -712,9 +861,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "Sign-in preview • real connections verify the server certificate",
             );
         }
-        tiny_skia::Pixmap::from_vec(data, tiny_skia::IntSize::from_wh(1100, 760).unwrap())
-            .unwrap()
-            .save_png(path)?;
+        tiny_skia::Pixmap::from_vec(
+            data,
+            tiny_skia::IntSize::from_wh(
+                (1100.0 * preview_scale).round() as u32,
+                (760.0 * preview_scale).round() as u32,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .save_png(path)?;
         return Ok(());
     }
     let runtime = tokio::runtime::Runtime::new()?;
@@ -758,6 +914,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         name.to_ascii_lowercase()
     };
+    app.auth.edits[0].end(&app.auth.username);
     EventLoop::new()?.run_app(&mut app)?;
     Ok(())
 }
