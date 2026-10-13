@@ -14,6 +14,8 @@ impl Theme {
 }
 type GlyphCache = HashMap<(char, u32), (fontdue::Metrics, Vec<u8>)>;
 pub struct Painter {
+    #[cfg(windows)]
+    pub native: Option<crate::native_text::NativeText>,
     pub cursor: Cell<(f64, f64)>,
     pub muted: Cell<bool>,
     pub elapsed: Cell<f32>,
@@ -23,6 +25,15 @@ pub struct Painter {
     pub selection: Cell<Option<(usize, usize)>>,
     pub view_start: Cell<usize>,
     pub force_caret_until: Cell<f32>,
+    pub blink_seconds: Cell<f32>,
+    pub caret_width: Cell<f32>,
+    pub window_focused: Cell<bool>,
+    pub composer_visible: Cell<bool>,
+    pub preedit: RefCell<maple_protocol::Secret>,
+    pub preedit_cursor: Cell<Option<(usize, usize)>>,
+    pub preedit_field: Cell<Option<usize>>,
+    pub ime_anchor: Cell<(f64, f64)>,
+    field_carets: RefCell<[Vec<(usize, f32)>; 2]>,
     font: fontdue::Font,
     glyphs: RefCell<GlyphCache>,
 }
@@ -98,6 +109,7 @@ impl Painter {
             470.0,
             form.field == 0 && !form.pending,
             false,
+            0,
         );
         self.field(
             &mut p,
@@ -108,6 +120,7 @@ impl Painter {
             470.0,
             form.field == 1 && !form.pending,
             true,
+            1,
         );
         self.rect(
             &mut p,
@@ -189,6 +202,8 @@ impl Painter {
             fontdue::FontSettings::default(),
         )?;
         Ok(Self {
+            #[cfg(windows)]
+            native: crate::native_text::NativeText::new().ok(),
             cursor: Cell::new((-1.0, -1.0)),
             muted: Cell::new(false),
             elapsed: Cell::new(0.0),
@@ -197,7 +212,16 @@ impl Painter {
             caret: Cell::new(usize::MAX),
             selection: Cell::new(None),
             view_start: Cell::new(0),
-            force_caret_until: Cell::new(0.0),
+            force_caret_until: Cell::new(0.53),
+            blink_seconds: Cell::new(0.53),
+            caret_width: Cell::new(1.0),
+            window_focused: Cell::new(true),
+            composer_visible: Cell::new(true),
+            preedit: RefCell::new(maple_protocol::Secret(String::new())),
+            preedit_cursor: Cell::new(None),
+            preedit_field: Cell::new(None),
+            ime_anchor: Cell::new((296.0, 680.0)),
+            field_carets: RefCell::new([Vec::new(), Vec::new()]),
             font,
             glyphs: RefCell::new(HashMap::new()),
         })
@@ -213,7 +237,35 @@ impl Painter {
         max: f32,
         active: bool,
         masked: bool,
+        index: usize,
     ) {
+        let preedit = self.preedit.borrow();
+        let composing = active && self.preedit_field.get() == Some(index) && !preedit.0.is_empty();
+        let (a, b) = edit.selection().unwrap_or((edit.caret, edit.caret));
+        let composed = if composing {
+            Some(zeroize::Zeroizing::new(format!(
+                "{}{}{}",
+                &value[..a],
+                preedit.0,
+                &value[b..]
+            )))
+        } else {
+            None
+        };
+        let value = composed.as_deref().map_or(value, |s| s.as_str());
+        let composition = if composing {
+            Some((a, a + preedit.0.len()))
+        } else {
+            None
+        };
+        let display_caret = if composing {
+            a + self
+                .preedit_cursor
+                .get()
+                .map_or(preedit.0.len(), |(_, end)| end.min(preedit.0.len()))
+        } else {
+            edit.caret
+        };
         let shown = if masked {
             "•".repeat(value.graphemes(true).count())
         } else {
@@ -226,45 +278,84 @@ impl Painter {
                 i.min(value.len())
             }
         };
-        let caret = map(edit.caret);
+        let caret = map(display_caret);
+        let positions = self.positions(&shown, 16.0);
+        let at = |byte: usize| {
+            positions[positions
+                .partition_point(|(i, _)| *i <= byte)
+                .saturating_sub(1)]
+            .1
+        };
         let mut start = 0;
-        while self.measure(&shown[start..caret], 16.0) > max - 4.0 {
+        while (at(caret) - at(start)) > max - 4.0 {
             start += shown[start..].chars().next().map_or(0, char::len_utf8);
         }
         let mut end = start;
         for (i, c) in shown[start..].char_indices() {
             let next = start + i + c.len_utf8();
-            if self.measure(&shown[start..next], 16.0) > max {
+            if (at(next) - at(start)) > max {
                 break;
             }
             end = next;
         }
-        if let Some((a, b)) = edit.selection().filter(|_| active) {
+        self.field_carets.borrow_mut()[index] = value
+            .grapheme_indices(true)
+            .map(|(i, _)| i)
+            .chain([value.len()])
+            .map(|i| (i, at(map(i)) - at(start)))
+            .collect();
+        if let Some((a, b)) = edit.selection().filter(|_| active && !composing) {
             let a = map(a).max(start).min(end);
             let b = map(b).max(start).min(end);
             if a < b {
-                let left = self.measure(&shown[start..a], 16.0);
+                let left = at(a) - at(start);
                 self.rect(
                     p,
                     x + left,
                     y - 18.0,
-                    self.measure(&shown[start..b], 16.0) - left,
+                    (at(b) - at(start)) - left,
                     24.0,
                     0xf2d1ac,
                 );
             }
         }
         self.text(p, &shown[start..end], x, y, 16.0, Theme::BARK, max);
-        if active && self.caret_visible() {
+        if let Some((a, b)) = composition {
+            let from = (at(map(a)) - at(start)).clamp(0.0, max);
+            let to = (at(map(b)) - at(start)).clamp(0.0, max);
             self.rect(
                 p,
-                x + self.measure(&shown[start..caret], 16.0),
-                y - 18.0,
-                1.2,
-                23.0,
-                Theme::AMBER,
+                x + from,
+                y + 3.0,
+                (to - from).max(0.0),
+                1.0 / self.scale.get(),
+                Theme::CRIMSON,
             );
         }
+        if active {
+            self.ime_anchor
+                .set(((x + at(caret) - at(start)) as f64, (y + 7.0) as f64));
+        }
+        if active && self.caret_visible() {
+            self.caret_rect(p, x + at(caret) - at(start), y - 18.0, 23.0);
+        }
+    }
+    pub fn field_caret_at(&self, index: usize, x: f32) -> usize {
+        let fields = self.field_carets.borrow();
+        let points = &fields[index];
+        for pair in points.windows(2) {
+            if x < (pair[0].1 + pair[1].1) * 0.5 {
+                return pair[0].0;
+            }
+        }
+        points.last().map_or(0, |(i, _)| *i)
+    }
+    pub fn clear_text_cache(&self) {
+        #[cfg(windows)]
+        if let Some(native) = &self.native {
+            native.clear();
+        }
+        *self.preedit.borrow_mut() = maple_protocol::Secret(String::new());
     }
     fn dimensions(&self, w: u32, h: u32) -> tiny_skia::IntSize {
         let (w, h) = self.pixel_size.get().unwrap_or((
@@ -274,6 +365,12 @@ impl Painter {
         tiny_skia::IntSize::from_wh(w, h).unwrap()
     }
     pub fn measure(&self, text: &str, size: f32) -> f32 {
+        #[cfg(windows)]
+        if let Some(native) = &self.native {
+            if let Ok(width) = native.measure(text, size) {
+                return width;
+            }
+        }
         let scale = self.scale.get();
         let mut previous = None;
         let mut width = 0.0;
@@ -286,18 +383,48 @@ impl Painter {
         }
         width / scale
     }
+    fn positions(&self, text: &str, size: f32) -> std::rc::Rc<Vec<(usize, f32)>> {
+        #[cfg(windows)]
+        if let Some(native) = &self.native {
+            if let Ok(positions) = native.positions(text, size) {
+                return positions;
+            }
+        }
+        let mut positions = vec![(0, 0.0)];
+        for (offset, g) in text.grapheme_indices(true) {
+            positions.push((
+                offset + g.len(),
+                self.measure(&text[..offset + g.len()], size),
+            ));
+        }
+        std::rc::Rc::new(positions)
+    }
     pub fn caret_at(&self, draft: &str, x: f32) -> usize {
         let start = self.view_start.get().min(draft.len());
-        let mut previous_width = 0.0;
-        for (offset, ch) in draft[start..].grapheme_indices(true) {
-            let end = start + offset + ch.len();
-            let width = self.measure(&draft[start..end], 15.0);
-            if x < (previous_width + width) * 0.5 {
-                return start + offset;
+        #[cfg(windows)]
+        if let Some(native) = &self.native {
+            if let Ok(byte) = native.hit_test(&draft[start..], 15.0, x) {
+                return start + byte;
             }
-            previous_width = width;
+        }
+        let positions = self.positions(&draft[start..], 15.0);
+        for pair in positions.windows(2) {
+            if x < (pair[0].1 + pair[1].1) * 0.5 {
+                return start + pair[0].0;
+            }
         }
         draft.len()
+    }
+    fn caret_rect(&self, p: &mut Pixmap, x: f32, y: f32, height: f32) {
+        let scale = self.scale.get();
+        self.rect(
+            p,
+            (x * scale).round() / scale,
+            (y * scale).round() / scale,
+            self.caret_width.get() / scale,
+            height,
+            Theme::AMBER,
+        );
     }
     fn color(c: u32) -> Color {
         Color::from_rgba8((c >> 16) as u8, (c >> 8) as u8, c as u8, 255)
@@ -334,9 +461,17 @@ impl Painter {
             );
         }
     }
-    fn caret_visible(&self) -> bool {
-        self.elapsed.get() < self.force_caret_until.get()
-            || ((self.elapsed.get() * 2.0) as u32).is_multiple_of(2)
+    pub fn caret_visible(&self) -> bool {
+        if !self.window_focused.get() {
+            return false;
+        }
+        if !self.blink_seconds.get().is_finite()
+            || self.elapsed.get() < self.force_caret_until.get()
+        {
+            return true;
+        }
+        !(((self.elapsed.get() - self.force_caret_until.get()) / self.blink_seconds.get()) as u32)
+            .is_multiple_of(2)
     }
     fn hovered(&self, x: f32, y: f32, w: f32, h: f32) -> bool {
         let (cx, cy) = self.cursor.get();
@@ -412,6 +547,15 @@ impl Painter {
     }
     #[allow(clippy::too_many_arguments)] // Raster primitive: position, style, and clipping width.
     fn text(&self, p: &mut Pixmap, s: &str, x: f32, y: f32, size: f32, c: u32, max: f32) {
+        #[cfg(windows)]
+        if let Some(native) = &self.native {
+            if native
+                .draw(p, s, x, y, size, c, max, self.scale.get())
+                .is_ok()
+            {
+                return;
+            }
+        }
         let scale = self.scale.get();
         let size = size * scale;
         let x = x * scale;
@@ -473,30 +617,24 @@ impl Painter {
         }
     }
     fn wrap(&self, s: &str, size: f32, max: f32) -> Vec<String> {
+        #[cfg(windows)]
+        if let Some(native) = &self.native {
+            if let Ok(lines) = native.wrap(s, size, max) {
+                return lines;
+            }
+        }
         let mut lines = Vec::new();
         let mut line = String::new();
-        let mut width = 0.0;
-        let mut previous = None;
-        for c in s.chars() {
-            let advance = self.font.metrics(c, size * self.scale.get()).advance_width
-                / self.scale.get()
-                + previous
-                    .and_then(|p| self.font.horizontal_kern(p, c, size * self.scale.get()))
-                    .unwrap_or(0.0)
-                    / self.scale.get();
-            if c == '\n' || width + advance > max {
+        for grapheme in s.graphemes(true) {
+            if grapheme.contains('\n') {
                 lines.push(std::mem::take(&mut line));
-                width = 0.0;
-                previous = None;
+                continue;
             }
-            if c != '\n' {
-                line.push(c);
-                width += if previous.is_none() {
-                    self.font.metrics(c, size * self.scale.get()).advance_width / self.scale.get()
-                } else {
-                    advance
-                };
-                previous = Some(c);
+            let previous = line.len();
+            line.push_str(grapheme);
+            if previous > 0 && self.measure(&line, size) > max {
+                let tail = line.split_off(previous);
+                lines.push(std::mem::replace(&mut line, tail));
             }
         }
         lines.push(line);
@@ -848,12 +986,49 @@ impl Painter {
             60.0,
         );
         let available = wf - 425.0;
-        let caret = self.caret.get().min(draft.len());
+        let preedit = self.preedit.borrow();
+        let composing = focused && self.composer_visible.get() && !preedit.0.is_empty();
+        let original_caret = self.caret.get().min(draft.len());
+        let (a, b) = self
+            .selection
+            .get()
+            .unwrap_or((original_caret, original_caret));
+        let composed = if composing {
+            Some(zeroize::Zeroizing::new(format!(
+                "{}{}{}",
+                &draft[..a],
+                preedit.0,
+                &draft[b..]
+            )))
+        } else {
+            None
+        };
+        let draft = composed.as_deref().map_or(draft, |s| s.as_str());
+        let composition = if composing {
+            Some((a, a + preedit.0.len()))
+        } else {
+            None
+        };
+        let caret = if composing {
+            a + self
+                .preedit_cursor
+                .get()
+                .map_or(preedit.0.len(), |(_, end)| end.min(preedit.0.len()))
+        } else {
+            original_caret
+        };
+        let positions = self.positions(draft, 15.0);
+        let at = |byte: usize| {
+            positions[positions
+                .partition_point(|(i, _)| *i <= byte)
+                .saturating_sub(1)]
+            .1
+        };
         let mut start = self.view_start.get().min(caret);
         while !draft.is_char_boundary(start) {
             start -= 1;
         }
-        while self.measure(&draft[start..caret], 15.0) > available - 12.0 {
+        while (at(caret) - if start == 0 { 0.0 } else { at(start) }) > available - 12.0 {
             start += draft[start..].graphemes(true).next().map_or(0, str::len);
         }
         // Recover the left margin as the caret moves back toward the beginning.
@@ -862,27 +1037,27 @@ impl Painter {
                 .grapheme_indices(true)
                 .next_back()
                 .map_or(0, |(i, _)| i);
-            if self.measure(&draft[before..caret], 15.0) > available - 12.0 {
+            if (at(caret) - if before == 0 { 0.0 } else { at(before) }) > available - 12.0 {
                 break;
             }
             start = before;
         }
         self.view_start.set(start);
+        let origin = if start == 0 { 0.0 } else { at(start) };
         let mut end = caret;
         for (offset, ch) in draft[caret..].char_indices() {
             let candidate = caret + offset + ch.len_utf8();
-            if self.measure(&draft[start..candidate], 15.0) > available - 4.0 {
+            if (at(candidate) - origin) > available - 4.0 {
                 break;
             }
             end = candidate;
         }
-        if let Some((a, b)) = self.selection.get().filter(|_| focused) {
+        if let Some((a, b)) = self.selection.get().filter(|_| focused && !composing) {
             let a = a.max(start).min(end);
             let b = b.max(start).min(end);
             if a < b {
-                let x = 296.0 + self.measure(&draft[start..a], 15.0);
-                let width =
-                    self.measure(&draft[start..b], 15.0) - self.measure(&draft[start..a], 15.0);
+                let x = 296.0 + (at(a).min(at(b)) - origin);
+                let width = (at(b) - at(a)).abs();
                 self.rect(&mut p, x, hf - 80.0, width, 26.0, 0xf2d1ac);
             }
         }
@@ -907,15 +1082,24 @@ impl Painter {
                 available,
             );
         }
-        if focused && self.caret_visible() {
+        if let Some((a, b)) = composition {
+            let from = (at(a) - origin).clamp(0.0, available);
+            let to = (at(b) - origin).clamp(0.0, available);
             self.rect(
                 &mut p,
-                296.0 + self.measure(&draft[start..caret], 15.0),
-                hf - 79.0,
-                1.2,
-                23.0,
-                Theme::AMBER,
+                296.0 + from,
+                hf - 55.0,
+                (to - from).max(0.0),
+                1.0 / self.scale.get(),
+                Theme::CRIMSON,
             );
+        }
+        if focused {
+            self.ime_anchor
+                .set(((296.0 + at(caret) - origin) as f64, (hf - 50.0) as f64));
+        }
+        if focused && self.caret_visible() {
+            self.caret_rect(&mut p, 296.0 + at(caret) - origin, hf - 79.0, 23.0);
         }
         self.text(&mut p, status, 282.0, hf - 17.0, 11.0, 0x806352, wf - 300.0);
         self.sound_chip(&mut p);
@@ -984,8 +1168,59 @@ fn coverage_at(bitmap: &[u8], width: usize, height: usize, x: f32, y: f32) -> f3
 mod tests {
     use super::*;
     #[test]
-    fn fractional_text_placement_changes_coverage_without_color_fringes() {
+    fn caret_resets_and_password_composition_never_enters_text_cache() {
         let painter = Painter::new().unwrap();
+        painter.elapsed.set(10.0);
+        painter.force_caret_until.set(10.53);
+        assert!(painter.caret_visible());
+        painter.elapsed.set(10.54);
+        assert!(!painter.caret_visible());
+        painter.window_focused.set(false);
+        painter.elapsed.set(11.2);
+        assert!(!painter.caret_visible());
+        painter.window_focused.set(true);
+        painter.blink_seconds.set(f32::INFINITY);
+        assert!(painter.caret_visible());
+        painter.composer_visible.set(false);
+        *painter.preedit.borrow_mut() = maple_protocol::Secret("秘密".into());
+        painter.preedit_cursor.set(Some((0, "秘密".len())));
+        painter.preedit_field.set(Some(1));
+        let mut form = crate::auth::Form {
+            field: 1,
+            ..Default::default()
+        };
+        form.insert("private-password");
+        let data = painter.draw(
+            1100,
+            760,
+            "general",
+            &VecDeque::new(),
+            "",
+            "Ready",
+            0,
+            false,
+            false,
+            &[],
+            &[],
+            0,
+            true,
+        );
+        let data = painter.sign_in(data, 1100, 760, &form, "Ready");
+        assert_eq!(data.len(), 1100 * 760 * 4);
+        #[cfg(windows)]
+        {
+            let native = painter.native.as_ref().unwrap();
+            assert!(!native.cached_fragment("秘密"));
+            assert!(!native.cached_fragment("private-password"));
+        }
+    }
+    #[test]
+    fn fractional_text_placement_changes_coverage_without_color_fringes() {
+        let mut painter = Painter::new().unwrap();
+        #[cfg(windows)]
+        {
+            painter.native = None;
+        }
         let render = |x| {
             let mut p = Pixmap::new(150, 50).unwrap();
             p.fill(Color::WHITE);
@@ -1037,6 +1272,17 @@ mod tests {
                 data.len(),
                 pixels.width() as usize * pixels.height() as usize * 4
             );
+            #[cfg(windows)]
+            assert!(
+                painter
+                    .native
+                    .as_ref()
+                    .unwrap()
+                    .measure("AV office", 15.0)
+                    .unwrap()
+                    > 0.0
+            );
+            #[cfg(not(windows))]
             assert!(painter
                 .glyphs
                 .borrow()

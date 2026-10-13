@@ -24,3 +24,5 @@ unicode-segmentation = "1.13"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_System_Memory"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_DirectWrite", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+windows-core = "0.61"

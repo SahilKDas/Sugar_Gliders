@@ -49,6 +49,17 @@ impl Form {
             self.edits[1].delete(&mut self.password.0, backward);
         }
     }
+    pub fn move_to(&mut self, caret: usize, selecting: bool) {
+        if self.pending {
+            return;
+        }
+        let text = if self.field == 0 {
+            &self.username
+        } else {
+            &self.password.0
+        };
+        self.edits[self.field].move_to(text, caret, selecting);
+    }
     pub fn navigate(&mut self, right: bool, selecting: bool, word: bool) {
         let text = if self.field == 0 {
             &self.username

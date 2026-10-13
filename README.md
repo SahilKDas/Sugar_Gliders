@@ -27,13 +27,22 @@ a two-client chat/voice test.
 
 Rounded parchment cards, avatar initials, selected-channel accents, hover feedback,
 blinking carets, and a gently pulsing speaking ring keep the native interface clear.
-Text rasterizes at the display's physical DPI with fractional glyph placement and
-kerning; it is never enlarged as part of a finished screenshot. Oversampled grayscale
-coverage avoids assuming an RGB/BGR panel layout. The composer supports mouse caret
-placement/drag selection, arrows, Shift selection, Ctrl+arrows, Home/End, Ctrl+A,
-Ctrl+C/X/V on Windows, and Unicode grapheme-aware insertion/deletion. Sign-in fields
-support cursor movement, selection, and paste; passwords cannot be copied or cut.
-A real vector caret stays visible while typing, then resumes blinking.
+Windows text uses the system DirectWrite software renderer and Segoe UI, including
+real ClearType RGB/BGR subpixel coverage, font shaping, fallback, and monitor rendering
+parameters. tiny-skia still draws every UI surface; the portable fallback uses the
+embedded Noto Sans font. Text is drawn at physical DPI, never enlarged after rendering.
+Cached native layouts supply matching caret positions and wrapping without repeated
+prefix shaping. ClearType blends directly into opaque backgrounds and selections.
+
+The editor supports cursor placement/drag selection in chat and sign-in fields,
+Shift selection, Ctrl+arrows, Home/End, Ctrl+A, and Windows Ctrl+C/X/V. Double-click
+selects a word; triple-click selects the draft. Ctrl+Backspace/Delete removes words;
+Ctrl+Z and Ctrl+Y (or Ctrl+Shift+Z) undo/redo drafts with bounded, coalesced history.
+Passwords cannot be copied/cut and are excluded from undo history. IME preedit is
+underlined, its candidate window follows the caret, and password composition stays
+masked. Windows caret width and blink settings are respected; typing resets the blink,
+focus loss hides the caret, and navigation is Unicode grapheme aware.
+
 UI animation pauses when the window loses focus. Warm synthesized chimes distinguish
 sending/receiving messages, sign-in/out, navigation, voice join/leave, errors, and
 sound toggles; typing adds a quiet short wooden tick. Sounds use output-only CPAL,
