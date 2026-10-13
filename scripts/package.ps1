@@ -9,7 +9,12 @@ if (-not (Test-Path -LiteralPath $source)) { throw 'Build the Windows client bef
 $dist=Join-Path $taskRoot 'dist'
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
 $destination=Join-Path $dist 'Maple.exe'
-Copy-Item -LiteralPath $source -Destination $destination -Force
+$copyRequired=-not (Test-Path -LiteralPath $destination)
+if (-not $copyRequired) { $copyRequired=(Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash }
+if ($copyRequired) {
+    try { Copy-Item -LiteralPath $source -Destination $destination -Force }
+    catch { throw "Unable to replace Maple.exe. Close the running app before packaging a changed binary. $($_.Exception.Message)" }
+}
 $binary=[IO.File]::ReadAllBytes($destination)
 $peOffset=[BitConverter]::ToInt32($binary,0x3c)
 $sectionCount=[BitConverter]::ToUInt16($binary,$peOffset+6)
