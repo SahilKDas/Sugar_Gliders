@@ -9,7 +9,11 @@ if (-not $env:CMAKE_GENERATOR -and (Test-Path 'C:\Program Files\Microsoft Visual
 }
 $arguments = @($Action, '--workspace', '--locked', '-j', '2')
 if ($Action -eq 'build') { $arguments += @('--profile', 'release') }
-$job = Start-Process cargo -ArgumentList $arguments -WorkingDirectory $taskRoot -WindowStyle Hidden -PassThru
+$logRoot=Join-Path $taskRoot '.cache'
+New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
+$outputLog=Join-Path $logRoot 'cargo.stdout.log'
+$errorLog=Join-Path $logRoot 'cargo.stderr.log'
+$job = Start-Process cargo -ArgumentList $arguments -WorkingDirectory $taskRoot -WindowStyle Hidden -RedirectStandardOutput $outputLog -RedirectStandardError $errorLog -PassThru
 while (-not $job.HasExited) {
     $bytes = (Get-ChildItem -LiteralPath $taskRoot -Force -Recurse -File | Measure-Object Length -Sum).Sum
     if ($bytes -gt 750000000) {
@@ -31,5 +35,8 @@ while (-not $job.HasExited) {
     Start-Sleep -Milliseconds 500
     $job.Refresh()
 }
+$job.WaitForExit()
+Get-Content -LiteralPath $outputLog
+Get-Content -LiteralPath $errorLog
 if ($job.ExitCode -ne 0) { throw "Cargo failed with code $($job.ExitCode)" }
 & "$PSScriptRoot/footprint.ps1"

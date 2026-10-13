@@ -2,7 +2,7 @@ mod input;
 mod ui;
 use futures_util::{SinkExt, StreamExt};
 use maple_protocol::{Command, Event};
-use std::{collections::VecDeque, num::NonZeroU32, rc::Rc, sync::mpsc};
+use std::{collections::VecDeque, num::NonZeroU32, rc::Rc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use winit::{
     application::ApplicationHandler,
@@ -19,15 +19,18 @@ struct App {
     room: String,
     groups: Vec<maple_protocol::Group>,
     members: Vec<String>,
+    league: usize,
+    last_speaking: bool,
     scroll: usize,
     cursor: (f64, f64),
     messages: VecDeque<(String, String, String)>,
     status: String,
     commands: tokio::sync::mpsc::Sender<Command>,
-    events: mpsc::Receiver<Event>,
+    events: tokio::sync::mpsc::Receiver<Event>,
     voice: Option<maple_audio::VoiceSession>,
 }
 const ROOMS: [&str; 3] = ["general", "introductions", "campfire"];
+const TRAIL_ROOMS: [&str; 3] = ["trail-chat", "trip-plans", "photos"];
 impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -53,7 +56,9 @@ impl ApplicationHandler for App {
         }
     }
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        let mut changed = false;
         while let Ok(event) = self.events.try_recv() {
+            changed = true;
             match event {
                 Event::Message {
                     channel,
@@ -93,7 +98,10 @@ impl ApplicationHandler for App {
                 _ => {}
             }
         }
-        if let Some(w) = &self.window {
+        let speaking = self.voice.as_ref().is_some_and(|v| v.speaking());
+        changed |= speaking != self.last_speaking;
+        self.last_speaking = speaking;
+        if let Some(w) = self.window.as_ref().filter(|_| changed) {
             w.request_redraw();
         }
         el.set_control_flow(ControlFlow::WaitUntil(
@@ -101,6 +109,14 @@ impl ApplicationHandler for App {
         ));
     }
     fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        let redraw = matches!(
+            &event,
+            WindowEvent::KeyboardInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::Resized(_)
+                | WindowEvent::ScaleFactorChanged { .. }
+        );
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::CursorMoved { position, .. } => self.cursor = (position.x, position.y),
@@ -120,10 +136,19 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
+                if self.cursor.0 < 68.0 && self.cursor.1 >= 88.0 && self.cursor.1 < 176.0 {
+                    self.league = usize::from(self.cursor.1 >= 132.0);
+                    let channels = if self.league == 0 { ROOMS } else { TRAIL_ROOMS };
+                    let _ = self.commands.try_send(Command::Join {
+                        channel: channels[0].into(),
+                    });
+                }
                 if self.cursor.0 < 260.0 && self.cursor.1 >= 190.0 && self.cursor.1 < 322.0 {
                     self.scroll = 0;
                     let _ = self.commands.try_send(Command::Join {
-                        channel: ROOMS[((self.cursor.1 - 190.0) / 44.0) as usize].into(),
+                        channel: (if self.league == 0 { ROOMS } else { TRAIL_ROOMS })
+                            [((self.cursor.1 - 190.0) / 44.0) as usize]
+                            .into(),
                     });
                 }
                 if self.cursor.0 >= 78.0 && self.cursor.0 < 252.0 && self.cursor.1 >= 470.0 {
@@ -139,7 +164,10 @@ impl ApplicationHandler for App {
                         self.voice = None;
                         self.status = "Voice disconnected".into();
                     } else {
-                        match maple_audio::VoiceSession::connect("127.0.0.1:8788") {
+                        match maple_audio::VoiceSession::connect(
+                            "127.0.0.1:8788",
+                            self.league as u32 + 1,
+                        ) {
                             Ok(v) => {
                                 self.voice = Some(v);
                                 self.status = "Voice connected • local Autumn Lounge".into();
@@ -175,10 +203,8 @@ impl ApplicationHandler for App {
                         self.draft.pop();
                     }
                     Key::Named(NamedKey::Escape) => self.draft.clear(),
-                    Key::Character(s) => {
-                        if self.draft.len() + s.len() <= 4096 {
-                            self.draft.push_str(&s);
-                        }
+                    Key::Character(s) if self.draft.len() + s.len() <= 4096 => {
+                        self.draft.push_str(&s)
                     }
                     _ => {}
                 }
@@ -206,11 +232,12 @@ impl ApplicationHandler for App {
                     speaking,
                     &self.groups,
                     &self.members,
+                    self.league,
                 );
                 let surface = self.surface.as_mut().unwrap();
                 if surface.resize(width, height).is_ok() {
                     if let Ok(mut buffer) = surface.buffer_mut() {
-                        for (dst, src) in buffer.iter_mut().zip(pixels.chunks_exact(4)) {
+                        for (dst, src) in buffer.iter_mut().zip(pixels.as_chunks::<4>().0) {
                             *dst = ((src[0] as u32) << 16) | ((src[1] as u32) << 8) | src[2] as u32;
                         }
                         let _ = buffer.present();
@@ -218,6 +245,11 @@ impl ApplicationHandler for App {
                 }
             }
             _ => {}
+        }
+        if redraw {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
         }
     }
 }
@@ -251,6 +283,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             false,
             &[],
             &["Rowan".into(), "You".into()],
+            0,
         );
         tiny_skia::Pixmap::from_vec(data, tiny_skia::IntSize::from_wh(1100, 760).unwrap())
             .unwrap()
@@ -259,21 +292,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let runtime = tokio::runtime::Runtime::new()?;
     let (commands, mut receiver) = tokio::sync::mpsc::channel::<Command>(64);
-    let (events, inbox) = mpsc::channel();
+    let (events, inbox) = tokio::sync::mpsc::channel(256);
     let name = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "Maple guest".into());
     runtime.spawn(async move {
         let result=connect_async("ws://127.0.0.1:8787").await;
-        let Ok((ws,_))=result else { let _=events.send(Event::Error("Offline • start maple-server, then restart client".into())); return; };
+        let Ok((ws,_))=result else { let _=events.send(Event::Error("Offline • start maple-server, then restart client".into())).await; return; };
         let (mut sink,mut stream)=ws.split();
-        let _=events.send(Event::Error("Connected • local development server".into()));
+        let _=events.send(Event::Error("Connected • local development server".into())).await;
         if sink.send(Message::Text(serde_json::to_string(&Command::Hello {name}).unwrap().into())).await.is_err(){return;}
         loop { tokio::select! {
             command=receiver.recv()=>{ let Some(c)=command else{break;}; if sink.send(Message::Text(serde_json::to_string(&c).unwrap().into())).await.is_err(){break;} },
-            event=stream.next()=>{ match event { Some(Ok(Message::Text(s)))=>{if let Ok(e)=serde_json::from_str(&s){let _=events.send(e);}}, Some(Ok(_))=>{}, _=>break } }
+            event=stream.next()=>{ match event { Some(Ok(Message::Text(s)))=>{if let Ok(e)=serde_json::from_str(&s){if events.send(e).await.is_err(){break;}}}, Some(Ok(_))=>{}, _=>break } }
         }}
-        let _=events.send(Event::Error("Disconnected • restart client to reconnect".into()));
+        let _=events.send(Event::Error("Disconnected • restart client to reconnect".into())).await;
     });
     let mut app = App {
         window: None,
@@ -283,6 +316,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         room: "general".into(),
         groups: Vec::new(),
         members: Vec::new(),
+        league: 0,
+        last_speaking: false,
         scroll: 0,
         cursor: (0.0, 0.0),
         messages: VecDeque::new(),

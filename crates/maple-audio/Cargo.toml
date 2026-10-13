@@ -2,6 +2,8 @@
 name = "maple-audio"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 [dependencies]
 cpal = "0.15"
 opus = "0.3"

@@ -11,22 +11,24 @@ use std::{
 };
 pub const FRAME: usize = 960;
 const MAGIC: &[u8; 4] = b"MPL1";
-pub fn packet(stream: u32, sequence: u16, payload: &[u8]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(payload.len() + 10);
+pub fn packet(room: u32, stream: u32, sequence: u16, payload: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(payload.len() + 14);
     b.extend_from_slice(MAGIC);
+    b.extend_from_slice(&room.to_be_bytes());
     b.extend_from_slice(&stream.to_be_bytes());
     b.extend_from_slice(&sequence.to_be_bytes());
     b.extend_from_slice(payload);
     b
 }
-pub fn unpack(b: &[u8]) -> Option<(u32, u16, &[u8])> {
-    if b.len() < 11 || b.len() > 1285 || &b[..4] != MAGIC {
+pub fn unpack(b: &[u8]) -> Option<(u32, u32, u16, &[u8])> {
+    if b.len() < 15 || b.len() > 1289 || &b[..4] != MAGIC {
         return None;
     }
     Some((
         u32::from_be_bytes(b[4..8].try_into().ok()?),
-        u16::from_be_bytes([b[8], b[9]]),
-        &b[10..],
+        u32::from_be_bytes(b[8..12].try_into().ok()?),
+        u16::from_be_bytes([b[12], b[13]]),
+        &b[14..],
     ))
 }
 #[derive(Default)]
@@ -37,6 +39,11 @@ pub struct JitterBuffer {
 impl JitterBuffer {
     pub fn push(&mut self, seq: u16, data: Vec<u8>) {
         if self.next.is_none() {
+            self.next = Some(seq);
+        }
+        let distance = seq.wrapping_sub(self.next.unwrap());
+        if (32..32768).contains(&distance) {
+            self.packets.clear();
             self.next = Some(seq);
         }
         let distance = seq.wrapping_sub(self.next.unwrap());
@@ -68,7 +75,7 @@ impl VoiceSession {
         self.active.load(Ordering::Relaxed)
     }
     /// Local development room only; public deployments require authenticated encrypted media.
-    pub fn connect(peer: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn connect(peer: &str, room: u32) -> Result<Self, Box<dyn std::error::Error>> {
         let socket = UdpSocket::bind("127.0.0.1:0")?;
         socket.connect(peer)?;
         socket.set_nonblocking(true)?;
@@ -95,22 +102,24 @@ impl VoiceSession {
             .config();
         let input_channels = input_config.channels as usize;
         let output_channels = output_config.channels as usize;
-        let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(8);
+        let (tx, rx) = mpsc::sync_channel::<[f32; FRAME]>(8);
         let playback = Arc::new(Mutex::new(VecDeque::<f32>::with_capacity(FRAME * 8)));
         let queue = playback.clone();
         let active = Arc::new(AtomicBool::new(false));
         let meter = active.clone();
-        let mut capture = Vec::with_capacity(FRAME);
+        let mut capture = [0f32; FRAME];
+        let mut captured = 0;
         let input = input_device.build_input_stream(
             &input_config,
             move |data: &[f32], _| {
                 for channels in data.chunks_exact(input_channels) {
-                    capture.push(channels.iter().sum::<f32>() / input_channels as f32);
-                    if capture.len() == FRAME {
+                    capture[captured] = channels.iter().sum::<f32>() / input_channels as f32;
+                    captured += 1;
+                    if captured == FRAME {
                         let energy = capture.iter().map(|s| s * s).sum::<f32>() / FRAME as f32;
                         meter.store(energy > 0.0004, Ordering::Relaxed);
-                        let frame = std::mem::replace(&mut capture, Vec::with_capacity(FRAME));
-                        let _ = tx.try_send(frame);
+                        let _ = tx.try_send(capture);
+                        captured = 0;
                     }
                 }
             },
@@ -140,14 +149,14 @@ impl VoiceSession {
         let worker = thread::spawn(move || {
             let mut seq = 0u16;
             let mut bytes = [0u8; 1275];
-            let mut incoming = [0u8; 1286];
+            let mut incoming = [0u8; 1290];
             let mut pcm = [0f32; FRAME];
             let mut speakers: BTreeMap<u32, Speaker> = BTreeMap::new();
             let mut tick = Instant::now() + Duration::from_millis(20);
             while !stopping.load(Ordering::Relaxed) {
                 while let Ok(frame) = rx.try_recv() {
                     if let Ok(n) = encoder.encode_float(&frame, &mut bytes) {
-                        let _ = socket.send(&packet(stream_id, seq, &bytes[..n]));
+                        let _ = socket.send(&packet(room, stream_id, seq, &bytes[..n]));
                         seq = seq.wrapping_add(1);
                     }
                 }
@@ -156,7 +165,10 @@ impl VoiceSession {
                     let Ok(n) = socket.recv(&mut incoming) else {
                         break;
                     };
-                    if let Some((id, seq, payload)) = unpack(&incoming[..n]) {
+                    if let Some((incoming_room, id, seq, payload)) = unpack(&incoming[..n]) {
+                        if incoming_room != room {
+                            continue;
+                        }
                         if !speakers.contains_key(&id) && speakers.len() < 10 {
                             if let Ok(decoder) = opus::Decoder::new(48000, opus::Channels::Mono) {
                                 speakers.insert(
@@ -228,10 +240,10 @@ mod tests {
     use super::*;
     #[test]
     fn framing() {
-        let p = packet(12, 65535, &[1, 2, 3]);
-        assert_eq!(unpack(&p), Some((12, 65535, &[1, 2, 3][..])));
+        let p = packet(1, 12, 65535, &[1, 2, 3]);
+        assert_eq!(unpack(&p), Some((1, 12, 65535, &[1, 2, 3][..])));
         assert!(unpack(b"bad").is_none());
-        assert!(unpack(&vec![0; 1286]).is_none());
+        assert!(unpack(&vec![0; 1290]).is_none());
     }
     #[test]
     fn reorder_loss_wrap() {

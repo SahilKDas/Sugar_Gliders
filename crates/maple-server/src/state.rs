@@ -7,7 +7,14 @@ pub struct State {
     pub online: BTreeSet<String>,
     pub history: BTreeMap<String, VecDeque<Event>>,
 }
-pub const CHANNELS: [&str; 3] = ["general", "introductions", "campfire"];
+pub const CHANNELS: [&str; 6] = [
+    "general",
+    "introductions",
+    "campfire",
+    "trail-chat",
+    "trip-plans",
+    "photos",
+];
 impl State {
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let path = std::path::Path::new("data/state.json");
@@ -18,7 +25,7 @@ impl State {
             return Err("State file exceeds 64 MB".into());
         }
         let state: Self = serde_json::from_slice(&std::fs::read(path)?)?;
-        if state.groups.len() > 64 || state.history.len() > 67 {
+        if state.groups.len() > 64 || state.history.len() > 70 {
             return Err("Too many saved chats".into());
         }
         for (id, g) in &state.groups {

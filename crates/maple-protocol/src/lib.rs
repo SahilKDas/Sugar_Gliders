@@ -59,6 +59,41 @@ pub struct League {
     pub name: String,
     pub channels: Vec<Channel>,
 }
+pub fn leagues() -> Vec<League> {
+    [
+        (
+            "autumn",
+            "Autumn League",
+            ["general", "introductions", "campfire"],
+        ),
+        (
+            "trail",
+            "Trail Friends",
+            ["trail-chat", "trip-plans", "photos"],
+        ),
+    ]
+    .into_iter()
+    .map(|(id, name, channels)| League {
+        id: id.into(),
+        name: name.into(),
+        channels: channels
+            .into_iter()
+            .map(|name| Channel {
+                id: name.into(),
+                name: name.into(),
+                category: "Gathering places".into(),
+                kind: ChannelKind::Text,
+            })
+            .chain(std::iter::once(Channel {
+                id: format!("{id}-lounge"),
+                name: "Autumn Lounge".into(),
+                category: "Voice".into(),
+                kind: ChannelKind::Voice,
+            }))
+            .collect(),
+    })
+    .collect()
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Command {
     Hello {

@@ -18,19 +18,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let permits = Arc::new(Semaphore::new(64));
     let voice = tokio::net::UdpSocket::bind("127.0.0.1:8788").await?;
     tokio::spawn(async move {
-        let mut bytes = [0u8; 1286];
+        let mut bytes = [0u8; 1290];
         let mut peers = std::collections::BTreeMap::new();
         while let Ok((n, peer)) = voice.recv_from(&mut bytes).await {
-            if maple_audio::unpack(&bytes[..n]).is_some() {
-                peers.retain(|_, last: &mut std::time::Instant| {
+            if let Some((room, _, _, _)) = maple_audio::unpack(&bytes[..n]) {
+                if !(1..=2).contains(&room) {
+                    continue;
+                }
+                peers.retain(|_, (_, last): &mut (u32, std::time::Instant)| {
                     last.elapsed() < std::time::Duration::from_secs(2)
                 });
                 if !peers.contains_key(&peer) && peers.len() >= 10 {
                     continue;
                 }
-                peers.insert(peer, std::time::Instant::now());
-                bytes[4..8].copy_from_slice(&(peer.port() as u32).to_be_bytes());
-                for target in peers.keys().filter(|p| **p != peer) {
+                peers.insert(peer, (room, std::time::Instant::now()));
+                bytes[8..12].copy_from_slice(&(peer.port() as u32).to_be_bytes());
+                for (target, _) in peers.iter().filter(|(p, (r, _))| **p != peer && *r == room) {
                     let _ = voice.send_to(&bytes[..n], target).await;
                 }
             }

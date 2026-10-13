@@ -1,4 +1,7 @@
-use std::collections::VecDeque;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+};
 use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Rect, Transform};
 pub struct Theme;
 impl Theme {
@@ -8,8 +11,10 @@ impl Theme {
     pub const BARK: u32 = 0x2b1e1a;
     pub const GOLD: u32 = 0xd9b875;
 }
+type GlyphCache = HashMap<(char, u32), (fontdue::Metrics, Vec<u8>)>;
 pub struct Painter {
     font: fontdue::Font,
+    glyphs: RefCell<GlyphCache>,
 }
 impl Painter {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
@@ -23,7 +28,10 @@ impl Painter {
             if let Ok(bytes) = std::fs::read(path) {
                 if let Ok(font) = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
                 {
-                    return Ok(Self { font });
+                    return Ok(Self {
+                        font,
+                        glyphs: RefCell::new(HashMap::new()),
+                    });
                 }
             }
         }
@@ -52,10 +60,48 @@ impl Painter {
             );
         }
     }
+    fn leaf(p: &mut Pixmap, x: f32, y: f32, c: u32) {
+        let mut path = PathBuilder::new();
+        path.move_to(x, y - 12.0);
+        for (dx, dy) in [
+            (4.0, -4.0),
+            (11.0, -8.0),
+            (8.0, 1.0),
+            (14.0, 4.0),
+            (3.0, 8.0),
+            (0.0, 14.0),
+            (-3.0, 8.0),
+            (-14.0, 4.0),
+            (-8.0, 1.0),
+            (-11.0, -8.0),
+            (-4.0, -4.0),
+        ] {
+            path.line_to(x + dx, y + dy);
+        }
+        path.close();
+        if let Some(path) = path.finish() {
+            let mut paint = Paint::default();
+            paint.set_color(Self::color(c));
+            p.fill_path(
+                &path,
+                &paint,
+                tiny_skia::FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+    }
+    #[allow(clippy::too_many_arguments)] // Raster primitive: position, style, and clipping width.
     fn text(&self, p: &mut Pixmap, s: &str, x: f32, y: f32, size: f32, c: u32, max: f32) {
         let mut pen = x;
         for ch in s.chars() {
-            let (m, bitmap) = self.font.rasterize(ch, size);
+            let mut cache = self.glyphs.borrow_mut();
+            if cache.len() > 2048 {
+                cache.clear();
+            }
+            let (m, bitmap) = cache
+                .entry((ch, size.to_bits()))
+                .or_insert_with(|| self.font.rasterize(ch, size));
             if pen + m.advance_width > x + max {
                 break;
             }
@@ -111,6 +157,7 @@ impl Painter {
         speaking: bool,
         groups: &[maple_protocol::Group],
         members: &[String],
+        league: usize,
     ) -> Vec<u8> {
         let mut p = Pixmap::new(w, h).expect("window pixmap");
         p.fill(Self::color(Theme::CREAM));
@@ -118,15 +165,27 @@ impl Painter {
         let hf = h as f32;
         Self::rect(&mut p, 0.0, 0.0, 68.0, hf, Theme::BARK);
         Self::circle(&mut p, 34.0, 45.0, 23.0, Theme::AMBER);
-        self.text(&mut p, "M", 22.0, 53.0, 24.0, Theme::CREAM, 30.0);
+        Self::leaf(&mut p, 34.0, 44.0, Theme::CREAM);
         Self::circle(&mut p, 34.0, 110.0, 20.0, Theme::CRIMSON);
-        self.text(&mut p, "L", 28.0, 116.0, 20.0, Theme::CREAM, 30.0);
+        Self::circle(
+            &mut p,
+            34.0,
+            154.0,
+            20.0,
+            if league == 1 { Theme::AMBER } else { 0x60463b },
+        );
+        self.text(&mut p, "T", 28.0, 161.0, 18.0, Theme::CREAM, 25.0);
+        self.text(&mut p, "A", 28.0, 116.0, 20.0, Theme::CREAM, 30.0);
         Self::rect(&mut p, 68.0, 0.0, 192.0, hf, 0xf3e6d5);
         Self::rect(&mut p, 260.0, 0.0, 1.0, hf, Theme::GOLD);
         self.text(&mut p, "MAPLE", 88.0, 44.0, 24.0, Theme::CRIMSON, 165.0);
         self.text(
             &mut p,
-            "Autumn League",
+            if league == 0 {
+                "Autumn League"
+            } else {
+                "Trail Friends"
+            },
             88.0,
             99.0,
             18.0,
@@ -134,7 +193,14 @@ impl Painter {
             165.0,
         );
         self.text(&mut p, "TEXT CHANNELS", 88.0, 164.0, 11.0, 0x806352, 165.0);
-        for (i, name) in ["general", "introductions", "campfire"].iter().enumerate() {
+        for (i, name) in (if league == 0 {
+            ["general", "introductions", "campfire"]
+        } else {
+            ["trail-chat", "trip-plans", "photos"]
+        })
+        .iter()
+        .enumerate()
+        {
             let y = 190.0 + i as f32 * 44.0;
             if *name == room {
                 Self::rect(&mut p, 78.0, y, 174.0, 38.0, 0xecc9a6);

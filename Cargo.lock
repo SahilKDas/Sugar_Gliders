@@ -1022,7 +1022,9 @@ name = "maple-server"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "maple-audio",
  "maple-protocol",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
