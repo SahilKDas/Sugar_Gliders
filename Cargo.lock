@@ -1001,6 +1001,7 @@ dependencies = [
  "futures-util",
  "maple-audio",
  "maple-protocol",
+ "maple-server",
  "serde_json",
  "softbuffer",
  "tiny-skia",

@@ -1,0 +1,6 @@
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+OPUS_STATIC = "1"
+CMAKE_TOOLCHAIN_FILE = { value = "cmake/static-msvc.cmake", relative = true }

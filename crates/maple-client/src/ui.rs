@@ -18,24 +18,14 @@ pub struct Painter {
 }
 impl Painter {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let paths = [
-            std::env::var("MAPLE_FONT").unwrap_or_default(),
-            "C:/Windows/Fonts/segoeui.ttf".into(),
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".into(),
-            "/System/Library/Fonts/Supplemental/Arial.ttf".into(),
-        ];
-        for path in paths {
-            if let Ok(bytes) = std::fs::read(path) {
-                if let Ok(font) = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
-                {
-                    return Ok(Self {
-                        font,
-                        glyphs: RefCell::new(HashMap::new()),
-                    });
-                }
-            }
-        }
-        Err("No system font found; set MAPLE_FONT to a TrueType font file".into())
+        let font = fontdue::Font::from_bytes(
+            &include_bytes!("../../../assets/fonts/NotoSans-Regular.ttf")[..],
+            fontdue::FontSettings::default(),
+        )?;
+        Ok(Self {
+            font,
+            glyphs: RefCell::new(HashMap::new()),
+        })
     }
     fn color(c: u32) -> Color {
         Color::from_rgba8((c >> 16) as u8, (c >> 8) as u8, c as u8, 255)
@@ -158,6 +148,7 @@ impl Painter {
         groups: &[maple_protocol::Group],
         members: &[String],
         league: usize,
+        focused: bool,
     ) -> Vec<u8> {
         let mut p = Pixmap::new(w, h).expect("window pixmap");
         p.fill(Self::color(Theme::CREAM));
@@ -384,7 +375,7 @@ impl Painter {
             );
             self.text(
                 &mut p,
-                "Start the server and invite another local client.",
+                "Your local backend starts automatically. Say hello.",
                 288.0,
                 181.0,
                 14.0,
@@ -403,23 +394,98 @@ impl Painter {
                 content_width,
             );
         }
-        Self::rect(&mut p, 280.0, hf - 91.0, wf - 300.0, 48.0, Theme::GOLD);
+        Self::rect(
+            &mut p,
+            280.0,
+            hf - 91.0,
+            wf - 300.0,
+            48.0,
+            if focused { Theme::AMBER } else { Theme::GOLD },
+        );
         Self::rect(&mut p, 281.0, hf - 90.0, wf - 302.0, 46.0, 0xffffff);
-        let shown = if draft.is_empty() {
-            "Write a message…"
-        } else {
-            draft
-        };
+        Self::rect(&mut p, wf - 106.0, hf - 90.0, 85.0, 46.0, Theme::AMBER);
         self.text(
             &mut p,
-            shown,
+            "Send",
+            wf - 88.0,
+            hf - 61.0,
+            15.0,
+            Theme::CREAM,
+            60.0,
+        );
+        let available = wf - 425.0;
+        let mut tail_width = 0.0;
+        let mut start = draft.len();
+        for (offset, c) in draft.char_indices().rev() {
+            let width = self.font.metrics(c, 15.0).advance_width;
+            if tail_width + width > available - 15.0 {
+                break;
+            }
+            tail_width += width;
+            start = offset;
+        }
+        let tail = &draft[start..];
+        let shown = if draft.is_empty() {
+            "Write a message…".to_string()
+        } else if focused {
+            format!("{tail}|")
+        } else {
+            tail.to_string()
+        };
+        if focused && draft.is_empty() {
+            Self::rect(&mut p, 294.0, hf - 78.0, 1.0, 22.0, Theme::AMBER);
+        }
+        self.text(
+            &mut p,
+            &shown,
             296.0,
             hf - 61.0,
             15.0,
             Theme::BARK,
-            wf - 325.0,
+            available,
         );
         self.text(&mut p, status, 282.0, hf - 17.0, 11.0, 0x806352, wf - 300.0);
+        p.take()
+    }
+    pub fn about(&self, data: Vec<u8>, w: u32, h: u32, scroll: usize) -> Vec<u8> {
+        let mut p = Pixmap::from_vec(data, tiny_skia::IntSize::from_wh(w, h).unwrap()).unwrap();
+        let wf = w as f32;
+        let hf = h as f32;
+        Self::rect(&mut p, 78.0, 16.0, wf - 94.0, hf - 32.0, Theme::GOLD);
+        Self::rect(&mut p, 79.0, 17.0, wf - 96.0, hf - 34.0, Theme::CREAM);
+        self.text(
+            &mut p,
+            "About Maple · Licenses",
+            100.0,
+            55.0,
+            23.0,
+            Theme::CRIMSON,
+            wf - 140.0,
+        );
+        self.text(
+            &mut p,
+            "F1 or Escape closes · Scroll to read licenses",
+            100.0,
+            83.0,
+            13.0,
+            Theme::BARK,
+            wf - 140.0,
+        );
+        let text=format!("Maple {}\nNative Rust UI, embedded local server, statically linked Opus.\nAuthentication and transport encryption are planned, not enabled.\n\n{}\n\nApplication source license:\n{}",env!("CARGO_PKG_VERSION"),include_str!("../../../assets/fonts/OFL.txt"),include_str!("../../../LICENSE"));
+        let lines = self.wrap(&text, 13.0, wf - 145.0);
+        let capacity = ((hf - 135.0) / 20.0).max(1.0) as usize;
+        let start = scroll.min(lines.len().saturating_sub(capacity));
+        for (i, line) in lines.iter().skip(start).take(capacity).enumerate() {
+            self.text(
+                &mut p,
+                line,
+                100.0,
+                119.0 + i as f32 * 20.0,
+                13.0,
+                Theme::BARK,
+                wf - 145.0,
+            );
+        }
         p.take()
     }
 }

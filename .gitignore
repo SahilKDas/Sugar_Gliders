@@ -7,4 +7,5 @@
 .cache/
 *.tmp
 /data/
+/dist/
 

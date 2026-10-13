@@ -1,14 +1,19 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 mod input;
+mod network;
 mod ui;
-use futures_util::{SinkExt, StreamExt};
 use maple_protocol::{Command, Event};
-use std::{collections::VecDeque, num::NonZeroU32, rc::Rc};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use network::ClientEvent;
+use std::{
+    collections::{HashMap, VecDeque},
+    num::NonZeroU32,
+    rc::Rc,
+};
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+    event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{Key, NamedKey},
+    keyboard::{Key, ModifiersState, NamedKey},
     window::{Window, WindowId},
 };
 struct App {
@@ -26,11 +31,111 @@ struct App {
     messages: VecDeque<(String, String, String)>,
     status: String,
     commands: tokio::sync::mpsc::Sender<Command>,
-    events: tokio::sync::mpsc::Receiver<Event>,
+    events: tokio::sync::mpsc::Receiver<ClientEvent>,
     voice: Option<maple_audio::VoiceSession>,
+    connected: bool,
+    requested_room: tokio::sync::watch::Sender<String>,
+    drafts: HashMap<String, String>,
+    composer_focused: bool,
+    modifiers: ModifiersState,
+    about: bool,
+    about_scroll: usize,
 }
 const ROOMS: [&str; 3] = ["general", "introductions", "campfire"];
 const TRAIL_ROOMS: [&str; 3] = ["trail-chat", "trip-plans", "photos"];
+impl App {
+    fn new(
+        commands: tokio::sync::mpsc::Sender<Command>,
+        events: tokio::sync::mpsc::Receiver<ClientEvent>,
+        requested_room: tokio::sync::watch::Sender<String>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            window: None,
+            surface: None,
+            ui: ui::Painter::new()?,
+            draft: String::new(),
+            room: "general".into(),
+            groups: Vec::new(),
+            members: Vec::new(),
+            league: 0,
+            last_speaking: false,
+            scroll: 0,
+            cursor: (0.0, 0.0),
+            messages: VecDeque::new(),
+            status: "Starting local backend…".into(),
+            commands,
+            events,
+            voice: None,
+            connected: false,
+            requested_room,
+            drafts: HashMap::new(),
+            composer_focused: true,
+            modifiers: ModifiersState::empty(),
+            about: false,
+            about_scroll: 0,
+        })
+    }
+    fn select_room(&mut self, channel: String) {
+        if ROOMS.contains(&channel.as_str()) {
+            self.league = 0;
+        } else if TRAIL_ROOMS.contains(&channel.as_str()) {
+            self.league = 1;
+        }
+        if channel != self.room {
+            self.drafts
+                .insert(self.room.clone(), std::mem::take(&mut self.draft));
+            self.draft = self.drafts.remove(&channel).unwrap_or_default();
+        }
+        self.room = channel.clone();
+        self.scroll = 0;
+        self.composer_focused = true;
+        self.members.clear();
+        let _ = self.requested_room.send(channel.clone());
+        if self.connected {
+            if self.commands.try_send(Command::Join { channel }).is_err() {
+                self.status = "Backend busy • channel selected; draft retained".into();
+            }
+        } else {
+            self.status = "Offline • channel selected; you can still write a draft".into();
+        }
+    }
+    fn submit(&mut self) {
+        if !maple_protocol::valid_text(&self.draft) {
+            return;
+        }
+        if !self.connected {
+            self.status = "Offline • reconnecting; your draft is retained".into();
+            return;
+        }
+        let command = match input::parse(&self.draft, &self.room) {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        if let Command::Join { channel } = command {
+            self.draft.clear();
+            self.select_room(channel);
+            return;
+        }
+        match self.commands.try_send(command) {
+            Ok(()) => {
+                self.draft.clear();
+                self.scroll = 0;
+            }
+            Err(_) => self.status = "Backend busy • draft retained".into(),
+        }
+    }
+    fn insert_text(&mut self, text: &str) {
+        for c in text.chars().filter(|c| !c.is_control()) {
+            if self.draft.len() + c.len_utf8() > maple_protocol::MAX_TEXT {
+                break;
+            }
+            self.draft.push(c);
+        }
+    }
+}
 impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -44,10 +149,12 @@ impl ApplicationHandler for App {
         ) {
             Ok(w) => {
                 let w = Rc::new(w);
+                w.set_ime_allowed(true);
                 let context = softbuffer::Context::new(w.clone()).expect("display context");
                 self.surface =
                     Some(softbuffer::Surface::new(&context, w.clone()).expect("display surface"));
                 self.window = Some(w);
+                self.window.as_ref().unwrap().request_redraw();
             }
             Err(e) => {
                 eprintln!("Window: {e}");
@@ -59,6 +166,17 @@ impl ApplicationHandler for App {
         let mut changed = false;
         while let Ok(event) = self.events.try_recv() {
             changed = true;
+            let event = match event {
+                ClientEvent::Wire(e) => e,
+                ClientEvent::Connection(connected, status) => {
+                    self.connected = connected;
+                    self.status = status;
+                    if !connected {
+                        self.members.clear();
+                    }
+                    continue;
+                }
+            };
             match event {
                 Event::Message {
                     channel,
@@ -71,11 +189,23 @@ impl ApplicationHandler for App {
                     }
                 }
                 Event::Error(s) => self.status = s,
-                Event::Groups(groups) => self.groups = groups,
+                Event::Groups(groups) => {
+                    self.groups = groups;
+                    if !ROOMS.contains(&self.room.as_str())
+                        && !TRAIL_ROOMS.contains(&self.room.as_str())
+                        && !self.groups.iter().any(|g| g.id == self.room)
+                    {
+                        self.select_room("general".into());
+                    }
+                }
                 Event::Presence { channel, members } if channel == self.room => {
                     self.members = members
                 }
                 Event::Joined(room) => {
+                    // Ignore stale acknowledgments for a previous click.
+                    if self.requested_room.borrow().as_str() != room {
+                        continue;
+                    }
                     self.room = room;
                     self.scroll = 0;
                 }
@@ -116,15 +246,35 @@ impl ApplicationHandler for App {
                 | WindowEvent::MouseInput { .. }
                 | WindowEvent::Resized(_)
                 | WindowEvent::ScaleFactorChanged { .. }
+                | WindowEvent::Ime(_)
+                | WindowEvent::Focused(_)
         );
         match event {
             WindowEvent::CloseRequested => el.exit(),
-            WindowEvent::CursorMoved { position, .. } => self.cursor = (position.x, position.y),
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale = self.window.as_ref().map_or(1.0, |w| w.scale_factor());
+                self.cursor = (position.x / scale, position.y / scale);
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::Ime(Ime::Commit(text)) if self.composer_focused && !self.about => {
+                self.insert_text(&text)
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 let y = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32,
                 };
+                if self.about {
+                    if y < 0.0 {
+                        self.about_scroll = self.about_scroll.saturating_add(3).min(500);
+                    } else {
+                        self.about_scroll = self.about_scroll.saturating_sub(3);
+                    }
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
                 if y > 0.0 {
                     self.scroll = (self.scroll + 1).min(500);
                 } else {
@@ -136,75 +286,90 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                if self.cursor.0 < 68.0 && self.cursor.1 >= 88.0 && self.cursor.1 < 176.0 {
-                    self.league = usize::from(self.cursor.1 >= 132.0);
-                    let channels = if self.league == 0 { ROOMS } else { TRAIL_ROOMS };
-                    let _ = self.commands.try_send(Command::Join {
-                        channel: channels[0].into(),
-                    });
-                }
-                if self.cursor.0 < 260.0 && self.cursor.1 >= 190.0 && self.cursor.1 < 322.0 {
-                    self.scroll = 0;
-                    let _ = self.commands.try_send(Command::Join {
-                        channel: (if self.league == 0 { ROOMS } else { TRAIL_ROOMS })
-                            [((self.cursor.1 - 190.0) / 44.0) as usize]
-                            .into(),
-                    });
-                }
-                if self.cursor.0 >= 78.0 && self.cursor.0 < 252.0 && self.cursor.1 >= 470.0 {
-                    let index = ((self.cursor.1 - 470.0) / 36.0) as usize;
-                    if let Some(g) = self.groups.get(index) {
-                        let _ = self.commands.try_send(Command::Join {
-                            channel: g.id.clone(),
-                        });
+                let Some(w) = &self.window else {
+                    return;
+                };
+                let size = w.inner_size().to_logical::<f64>(w.scale_factor());
+                let control = input::hit_test(
+                    self.cursor.0,
+                    self.cursor.1,
+                    size.width,
+                    size.height,
+                    self.groups.len(),
+                );
+                if self.about {
+                    if control == input::Control::About {
+                        self.about = false;
                     }
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
                 }
-                if self.cursor.0 < 260.0 && self.cursor.1 > 380.0 && self.cursor.1 < 430.0 {
-                    if self.voice.is_some() {
-                        self.voice = None;
-                        self.status = "Voice disconnected".into();
-                    } else {
-                        match maple_audio::VoiceSession::connect(
-                            "127.0.0.1:8788",
-                            self.league as u32 + 1,
-                        ) {
-                            Ok(v) => {
-                                self.voice = Some(v);
-                                self.status = "Voice connected • local Autumn Lounge".into();
+                match control {
+                    input::Control::About => self.about = true,
+                    input::Control::League(index) => {
+                        self.league = index;
+                        let channels = if index == 0 { ROOMS } else { TRAIL_ROOMS };
+                        self.select_room(channels[0].into());
+                    }
+                    input::Control::Channel(index) => self.select_room(
+                        (if self.league == 0 { ROOMS } else { TRAIL_ROOMS })[index].into(),
+                    ),
+                    input::Control::Group(index) => {
+                        if let Some(g) = self.groups.get(index) {
+                            self.select_room(g.id.clone());
+                        }
+                    }
+                    input::Control::Composer => self.composer_focused = true,
+                    input::Control::Send => self.submit(),
+                    input::Control::None => self.composer_focused = false,
+                    input::Control::Voice => {
+                        if !self.connected {
+                            self.status = "Voice requires a connection to the local backend".into();
+                        } else {
+                            if self.voice.is_some() {
+                                self.voice = None;
+                                self.status = "Voice disconnected".into();
+                            } else {
+                                match maple_audio::VoiceSession::connect(
+                                    "127.0.0.1:8788",
+                                    self.league as u32 + 1,
+                                ) {
+                                    Ok(v) => {
+                                        self.voice = Some(v);
+                                        self.status =
+                                            "Voice connected • local Autumn Lounge".into();
+                                    }
+                                    Err(e) => self.status = format!("Voice: {e}"),
+                                }
                             }
-                            Err(e) => self.status = format!("Voice: {e}"),
                         }
                     }
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 match event.logical_key {
-                    Key::Named(NamedKey::Enter) => {
-                        if maple_protocol::valid_text(&self.draft) {
-                            let command = match input::parse(&self.draft, &self.room) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    self.status = e;
-                                    return;
-                                }
-                            };
-                            match self.commands.try_send(command) {
-                                Ok(()) => {
-                                    self.draft.clear();
-                                    self.scroll = 0;
-                                }
-                                Err(_) => {
-                                    self.status = "Connection unavailable; draft retained".into()
-                                }
-                            }
-                        }
+                    Key::Named(NamedKey::F1) => {
+                        self.about = !self.about;
+                        self.about_scroll = 0;
                     }
-                    Key::Named(NamedKey::Backspace) => {
+                    Key::Named(NamedKey::Escape) if self.about => self.about = false,
+                    _ if self.about => {}
+                    Key::Named(NamedKey::Tab) => self.composer_focused = true,
+                    Key::Named(NamedKey::Enter) => {
+                        self.submit();
+                    }
+                    Key::Named(NamedKey::Backspace) if self.composer_focused => {
                         self.draft.pop();
                     }
                     Key::Named(NamedKey::Escape) => self.draft.clear(),
-                    Key::Character(s) if self.draft.len() + s.len() <= 4096 => {
-                        self.draft.push_str(&s)
+                    Key::Character(s)
+                        if self.composer_focused
+                            && !self.modifiers.control_key()
+                            && !self.modifiers.super_key() =>
+                    {
+                        self.insert_text(event.text.as_deref().unwrap_or(&s));
                     }
                     _ => {}
                 }
@@ -220,9 +385,10 @@ impl ApplicationHandler for App {
                     return;
                 };
                 let speaking = self.voice.as_ref().is_some_and(|v| v.speaking());
-                let pixels = self.ui.draw(
-                    size.width,
-                    size.height,
+                let logical = size.to_logical::<u32>(w.scale_factor());
+                let mut pixels = self.ui.draw(
+                    logical.width,
+                    logical.height,
                     &self.room,
                     &self.messages,
                     &self.draft,
@@ -233,7 +399,33 @@ impl ApplicationHandler for App {
                     &self.groups,
                     &self.members,
                     self.league,
+                    self.composer_focused,
                 );
+                if self.about {
+                    pixels =
+                        self.ui
+                            .about(pixels, logical.width, logical.height, self.about_scroll);
+                }
+                if logical.width != size.width || logical.height != size.height {
+                    let image = tiny_skia::Pixmap::from_vec(
+                        pixels,
+                        tiny_skia::IntSize::from_wh(logical.width, logical.height).unwrap(),
+                    )
+                    .unwrap();
+                    let mut scaled = tiny_skia::Pixmap::new(size.width, size.height).unwrap();
+                    scaled.draw_pixmap(
+                        0,
+                        0,
+                        image.as_ref(),
+                        &tiny_skia::PixmapPaint::default(),
+                        tiny_skia::Transform::from_scale(
+                            size.width as f32 / logical.width as f32,
+                            size.height as f32 / logical.height as f32,
+                        ),
+                        None,
+                    );
+                    pixels = scaled.take();
+                }
                 let surface = self.surface.as_mut().unwrap();
                 if surface.resize(width, height).is_ok() {
                     if let Ok(mut buffer) = surface.buffer_mut() {
@@ -254,6 +446,14 @@ impl ApplicationHandler for App {
     }
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().nth(1).as_deref() == Some("--licenses") {
+        println!(
+            "{}\n\n{}",
+            include_str!("../../../LICENSE"),
+            include_str!("../../../assets/fonts/OFL.txt")
+        );
+        return Ok(());
+    }
     if let Some(path) = std::env::args()
         .nth(1)
         .filter(|s| s == "--render")
@@ -284,6 +484,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[],
             &["Rowan".into(), "You".into()],
             0,
+            true,
         );
         tiny_skia::Pixmap::from_vec(data, tiny_skia::IntSize::from_wh(1100, 760).unwrap())
             .unwrap()
@@ -291,41 +492,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let runtime = tokio::runtime::Runtime::new()?;
-    let (commands, mut receiver) = tokio::sync::mpsc::channel::<Command>(64);
+    let (commands, receiver) = tokio::sync::mpsc::channel::<Command>(64);
     let (events, inbox) = tokio::sync::mpsc::channel(256);
+    let (requested_room, room_watch) = tokio::sync::watch::channel("general".to_string());
     let name = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "Maple guest".into());
+        .unwrap_or_else(|| format!("Guest-{}", std::process::id()));
+    let data_dir = std::env::var_os("MAPLE_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .or_else(|| std::env::var_os("XDG_DATA_HOME"))
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join("Maple")
+        });
+    let backend_events = events.clone();
     runtime.spawn(async move {
-        let result=connect_async("ws://127.0.0.1:8787").await;
-        let Ok((ws,_))=result else { let _=events.send(Event::Error("Offline • start maple-server, then restart client".into())).await; return; };
-        let (mut sink,mut stream)=ws.split();
-        let _=events.send(Event::Error("Connected • local development server".into())).await;
-        if sink.send(Message::Text(serde_json::to_string(&Command::Hello {name}).unwrap().into())).await.is_err(){return;}
-        loop { tokio::select! {
-            command=receiver.recv()=>{ let Some(c)=command else{break;}; if sink.send(Message::Text(serde_json::to_string(&c).unwrap().into())).await.is_err(){break;} },
-            event=stream.next()=>{ match event { Some(Ok(Message::Text(s)))=>{if let Ok(e)=serde_json::from_str(&s){if events.send(e).await.is_err(){break;}}}, Some(Ok(_))=>{}, _=>break } }
-        }}
-        let _=events.send(Event::Error("Disconnected • restart client to reconnect".into())).await;
+        loop {
+            match maple_server::run(data_dir.clone()).await {
+                Ok(()) => return,
+                Err(e) => {
+                    if !e
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::AddrInUse)
+                    {
+                        let message = format!("Local backend: {e}");
+                        let _ = backend_events
+                            .send(ClientEvent::Connection(false, message))
+                            .await;
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
     });
-    let mut app = App {
-        window: None,
-        surface: None,
-        ui: ui::Painter::new()?,
-        draft: String::new(),
-        room: "general".into(),
-        groups: Vec::new(),
-        members: Vec::new(),
-        league: 0,
-        last_speaking: false,
-        scroll: 0,
-        cursor: (0.0, 0.0),
-        messages: VecDeque::new(),
-        status: "Connecting…".into(),
-        commands,
-        events: inbox,
-        voice: None,
-    };
+    runtime.spawn(network::run(name, receiver, events, room_watch));
+    let mut app = App::new(commands, inbox, requested_room)?;
     EventLoop::new()?.run_app(&mut app)?;
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn offline_navigation_typing_and_drafts() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let (_events, inbox) = tokio::sync::mpsc::channel(8);
+        let (selected, room) = tokio::sync::watch::channel("general".into());
+        let mut app = App::new(tx, inbox, selected).unwrap();
+        app.insert_text("Hello maple 🍁");
+        app.select_room("introductions".into());
+        assert_eq!(app.room, "introductions");
+        assert_eq!(room.borrow().as_str(), "introductions");
+        assert!(app.draft.is_empty());
+        app.insert_text("My introduction");
+        app.submit();
+        assert_eq!(app.draft, "My introduction");
+        assert!(rx.try_recv().is_err());
+        app.select_room("general".into());
+        assert_eq!(app.draft, "Hello maple 🍁");
+        app.connected = true;
+        app.submit();
+        assert!(
+            matches!(rx.try_recv().unwrap(),Command::Send{channel,text} if channel=="general"&&text=="Hello maple 🍁")
+        );
+        assert!(app.draft.is_empty());
+    }
 }

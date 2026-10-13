@@ -6,6 +6,8 @@ pub struct State {
     #[serde(skip)]
     pub online: BTreeSet<String>,
     pub history: BTreeMap<String, VecDeque<Event>>,
+    #[serde(skip)]
+    pub directory: std::path::PathBuf,
 }
 pub const CHANNELS: [&str; 6] = [
     "general",
@@ -16,15 +18,21 @@ pub const CHANNELS: [&str; 6] = [
     "photos",
 ];
 impl State {
-    pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
-        let path = std::path::Path::new("data/state.json");
+    pub fn load_from(
+        directory: &std::path::Path,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let path = directory.join("state.json");
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok(Self {
+                directory: directory.to_owned(),
+                ..Self::default()
+            });
         }
         if path.metadata()?.len() > 64000000 {
             return Err("State file exceeds 64 MB".into());
         }
-        let state: Self = serde_json::from_slice(&std::fs::read(path)?)?;
+        let mut state: Self = serde_json::from_slice(&std::fs::read(path)?)?;
+        state.directory = directory.to_owned();
         if state.groups.len() > 64 || state.history.len() > 70 {
             return Err("Too many saved chats".into());
         }
@@ -56,7 +64,7 @@ impl State {
         }
         Ok(state)
     }
-    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn save(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let groups = self
             .groups
             .iter()
@@ -73,19 +81,23 @@ impl State {
             groups,
             history,
             online: BTreeSet::new(),
+            directory: std::path::PathBuf::new(),
         };
         let bytes = serde_json::to_vec(&snapshot)?;
         if bytes.len() > 64000000 {
             return Err("Persistent state exceeds 64 MB".into());
         }
-        std::fs::create_dir_all("data")?;
+        std::fs::create_dir_all(&self.directory)?;
         {
             use std::io::Write;
-            let mut file = std::fs::File::create("data/state.tmp")?;
+            let mut file = std::fs::File::create(self.directory.join("state.tmp"))?;
             file.write_all(&bytes)?;
             file.sync_all()?;
         }
-        std::fs::rename("data/state.tmp", "data/state.json")?;
+        std::fs::rename(
+            self.directory.join("state.tmp"),
+            self.directory.join("state.json"),
+        )?;
         Ok(())
     }
     pub fn allowed(&self, name: &str, channel: &str) -> bool {

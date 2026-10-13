@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 maple-protocol.workspace = true
 maple-audio.workspace = true
+maple-server = {path="../maple-server"}
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
