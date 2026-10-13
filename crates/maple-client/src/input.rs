@@ -8,9 +8,13 @@ pub enum Control {
     Composer,
     Send,
     About,
+    Logout,
     None,
 }
 pub fn hit_test(x: f64, y: f64, width: f64, height: f64, groups: usize) -> Control {
+    if (width - 135.0..width - 20.0).contains(&x) && (14.0..59.0).contains(&y) {
+        return Control::Logout;
+    }
     if (11.0..57.0).contains(&x) && (22.0..69.0).contains(&y) {
         return Control::About;
     }

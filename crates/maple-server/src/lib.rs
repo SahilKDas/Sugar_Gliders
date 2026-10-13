@@ -24,7 +24,12 @@ struct Shared {
     names: RwLock<BTreeMap<String, String>>,
     db: Accounts,
     bus: broadcast::Sender<Event>,
-    attempts: Mutex<BTreeMap<IpAddr, (Instant, u32)>>,
+    attempts: Mutex<Attempts>,
+}
+#[derive(Default)]
+struct Attempts {
+    addresses: BTreeMap<IpAddr, (Instant, u32)>,
+    accounts: BTreeMap<String, (Instant, u32)>,
 }
 fn display(event: Event, names: &BTreeMap<String, String>) -> Event {
     let name = |id: String| {
@@ -64,15 +69,36 @@ fn display(event: Event, names: &BTreeMap<String, String>) -> Event {
     }
 }
 impl Shared {
-    async fn auth_allowed(&self, ip: IpAddr) -> bool {
+    async fn auth_allowed(&self, ip: IpAddr, username: Option<&str>) -> bool {
         let mut attempts = self.attempts.lock().await;
-        attempts.retain(|_, (start, _)| start.elapsed() < Duration::from_secs(60));
-        if !attempts.contains_key(&ip) && attempts.len() >= 1024 {
+        attempts
+            .addresses
+            .retain(|_, (start, _)| start.elapsed() < Duration::from_secs(60));
+        attempts
+            .accounts
+            .retain(|_, (start, _)| start.elapsed() < Duration::from_secs(60));
+        if !attempts.addresses.contains_key(&ip) && attempts.addresses.len() >= 1024 {
             return false;
         }
-        let (_, count) = attempts.entry(ip).or_insert((Instant::now(), 0));
+        let (_, count) = attempts.addresses.entry(ip).or_insert((Instant::now(), 0));
         *count += 1;
-        *count <= 20
+        if *count > 20 {
+            return false;
+        }
+        if let Some(username) = username.filter(|name| accounts::valid_username(name)) {
+            if !attempts.accounts.contains_key(username) && attempts.accounts.len() >= 2048 {
+                return false;
+            }
+            let (_, count) = attempts
+                .accounts
+                .entry(username.to_owned())
+                .or_insert((Instant::now(), 0));
+            *count += 1;
+            if *count > 8 {
+                return false;
+            }
+        }
+        true
     }
     async fn revoke_connections(&self, token: &Secret) {
         let peers = self.peers.lock().await;
@@ -94,6 +120,18 @@ pub async fn run(directory: PathBuf) -> Result<(), Error> {
     drop(endpoint);
     Ok(())
 }
+pub fn data_directory() -> PathBuf {
+    std::env::var_os("MAPLE_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .or_else(|| std::env::var_os("XDG_DATA_HOME"))
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join("Maple")
+        })
+        .join("secure-v2")
+}
 /// Separate config for hermetic tests; production local launcher remains loopback-only.
 pub async fn start(directory: PathBuf, address: SocketAddr) -> Result<quinn::Endpoint, Error> {
     // Claim the socket before generating persistent identity files; multiple instances cannot race.
@@ -112,15 +150,7 @@ pub async fn start(directory: PathBuf, address: SocketAddr) -> Result<quinn::End
         None => state::State::default(),
         _ => return Err("Snapshot exceeds capacity".into()),
     };
-    if state.groups.len() > 64
-        || state.history.len() > 70
-        || state.groups.values().any(|g| {
-            !(2..=10).contains(&g.members.len())
-                || g.members.iter().any(|id| !names.contains_key(id))
-        })
-    {
-        return Err("Invalid secure chat snapshot".into());
-    }
+    state.validate(&names)?;
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(maple_transport::server_config(cert, key)?),
@@ -134,7 +164,7 @@ pub async fn start(directory: PathBuf, address: SocketAddr) -> Result<quinn::End
         names: RwLock::new(names),
         db,
         bus,
-        attempts: Mutex::new(BTreeMap::new()),
+        attempts: Mutex::new(Attempts::default()),
     });
     let accepting = endpoint.clone();
     tokio::spawn(async move {

@@ -12,8 +12,6 @@ license = "MPL-2.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time","io-util"] }
-futures-util = "0.3"
-tokio-tungstenite = "0.28"
 maple-protocol = { path = "crates/maple-protocol" }
 maple-audio = { path = "crates/maple-audio" }
 maple-transport = {path="crates/maple-transport"}

@@ -61,7 +61,10 @@ async fn command(
     match command {
         Command::Register { .. } | Command::Login { .. } => error("Already signed in"),
         Command::Resume { token } if c.user.is_none() => {
-            if !shared.auth_allowed(connection.remote_address().ip()).await {
+            if !shared
+                .auth_allowed(connection.remote_address().ip(), None)
+                .await
+            {
                 return error("Sign-in rate limit: try again in a minute");
             }
             match shared.db.resume(token.clone()).await {
@@ -74,7 +77,9 @@ async fn command(
         }
         Command::Logout => {
             if let Some(token) = c.token.take() {
-                shared.db.revoke(token).await;
+                if let Err(e) = shared.db.revoke(token).await {
+                    return error(e);
+                }
             }
             shared.peers.lock().await.remove(&id);
             vec![Event::SignedOut]
@@ -228,7 +233,7 @@ pub(super) async fn run(
                 let Some(incoming)=incoming else{break;};let register=matches!(&incoming,Command::Register{..});let logout=matches!(&incoming,Command::Logout);
                 let outgoing=match incoming{
                     Command::Register{username,password}|Command::Login{username,password} if c.user.is_none()=>{
-                        if !shared.auth_allowed(connection.remote_address().ip()).await{error("Sign-in rate limit: try again in a minute")}else{match shared.db.password(username,password,register).await{Ok((identity,token))=>authenticate(&mut c,&shared,&connection,id,identity,token).await,Err(e)=>error(e)}}
+                        if !shared.auth_allowed(connection.remote_address().ip(),Some(&username)).await{error("Sign-in rate limit: try again in a minute")}else{match shared.db.password(username,password,register).await{Ok((identity,token))=>authenticate(&mut c,&shared,&connection,id,identity,token).await,Err(e)=>error(e)}}
                     },other=>command(&mut c,&shared,&connection,id,other).await
                 };
                 if logout{for e in outgoing{write(&mut output,&e).await?;}break;}outgoing

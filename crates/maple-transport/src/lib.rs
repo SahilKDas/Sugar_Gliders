@@ -108,3 +108,39 @@ pub async fn read<T: serde::de::DeserializeOwned>(
     stream.read_exact(&mut bytes).await?;
     Ok(serde_json::from_slice(&bytes)?)
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn rejects_expired_certificates() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        let cert = params.self_signed(&key).unwrap().der().to_vec();
+        let server = quinn::Endpoint::server(
+            server_config(cert.clone(), key.serialize_der()).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let accept = server.clone();
+        let task = tokio::spawn(async move {
+            if let Some(c) = accept.accept().await {
+                let _ = c.await;
+            }
+        });
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(client_config(cert).unwrap());
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            client
+                .connect(server.local_addr().unwrap(), "localhost")
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        server.close(0u8.into(), b"Done");
+        task.abort();
+    }
+}

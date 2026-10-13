@@ -63,10 +63,15 @@ impl Accounts {
                 .to_string(),
         };
         let c = db.connection()?;
+        let version: i64 = c.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > 1 {
+            return Err("Unsupported account database schema version".into());
+        }
         c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA max_page_count=16384; PRAGMA journal_size_limit=1048576;
           CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, hash TEXT NOT NULL, created INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS sessions(digest BLOB PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS snapshots(id INTEGER PRIMARY KEY CHECK(id=1), body BLOB NOT NULL);
+          CREATE TRIGGER IF NOT EXISTS user_capacity BEFORE INSERT ON users WHEN (SELECT COUNT(*) FROM users)>=1024 BEGIN SELECT RAISE(ABORT,'account capacity reached'); END;
           PRAGMA user_version=1;")?;
         Ok(db)
     }
@@ -159,7 +164,7 @@ impl Accounts {
     }
     fn issue(&self, user: &Identity) -> Result<Secret, Error> {
         let mut c = self.connection()?;
-        let transaction = c.transaction()?;
+        let transaction = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         transaction.execute("DELETE FROM sessions WHERE expires<=?1", [now()])?;
         // Bound remembered sessions per account, including those abandoned by a crash.
         let count: i64 = transaction.query_row(
@@ -211,11 +216,14 @@ impl Accounts {
             .execute("DELETE FROM sessions WHERE digest=?1", [digest(&token.0)])?;
         Ok(())
     }
-    pub async fn revoke(&self, token: Secret) {
+    pub async fn revoke(&self, token: Secret) -> Result<(), String> {
         let db = self.clone();
-        let _ =
-            tokio::task::spawn_blocking(move || db.revoke_sync(&token).map_err(|e| e.to_string()))
-                .await;
+        tokio::task::spawn_blocking(move || {
+            db.revoke_sync(&token)
+                .map_err(|_| "Session revocation storage unavailable".to_string())
+        })
+        .await
+        .map_err(|_| "Session revocation unavailable".to_string())?
     }
     pub fn names(&self) -> Result<std::collections::BTreeMap<String, String>, Error> {
         let c = self.connection()?;
@@ -235,7 +243,9 @@ impl Accounts {
         }
         let c = self.connection()?;
         c.execute("INSERT INTO snapshots(id,body) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET body=excluded.body",[bytes])?;
-        c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        // The upsert is already committed. Checkpoint contention must not make the
+        // caller roll back memory after durable storage has accepted the mutation.
+        let _ = c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
         Ok(())
     }
 }

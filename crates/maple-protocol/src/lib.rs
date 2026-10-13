@@ -187,6 +187,16 @@ pub fn valid_text(s: &str) -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn secrets_are_redacted_and_text_is_bounded() {
+        let command = Command::Login {
+            username: "alice".into(),
+            password: Secret("do not expose this password".into()),
+        };
+        assert!(!format!("{command:?}").contains("do not expose"));
+        assert!(!valid_text("null\0character"));
+        assert!(valid_text("line one\nline two"));
+    }
+    #[test]
     fn membership_limits() {
         assert!(Group::new("g".into(), ["a".into(), "a".into()], false).is_err());
         let mut g = Group::new("g".into(), ["a".into(), "b".into()], false).unwrap();

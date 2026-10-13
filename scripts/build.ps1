@@ -2,6 +2,7 @@ param([ValidateSet('build','test','check','clippy')][string]$Action='build',[Ali
 $ErrorActionPreference = 'Stop'
 $taskRoot = (Resolve-Path (Split-Path $PSScriptRoot -Parent)).Path
 Set-Location -LiteralPath $taskRoot
+. "$PSScriptRoot/measure.ps1"
 & "$PSScriptRoot/footprint.ps1"
 # Workstation workaround: older CMake cannot generate Visual Studio 2026 projects.
 if (-not $env:CMAKE_GENERATOR -and (Test-Path 'C:\Program Files\Microsoft Visual Studio\2022')) {
@@ -16,7 +17,8 @@ $outputLog=Join-Path $logRoot 'cargo.stdout.log'
 $errorLog=Join-Path $logRoot 'cargo.stderr.log'
 $job = Start-Process cargo -ArgumentList $arguments -WorkingDirectory $taskRoot -WindowStyle Hidden -RedirectStandardOutput $outputLog -RedirectStandardError $errorLog -PassThru
 while (-not $job.HasExited) {
-    $bytes = (Get-ChildItem -LiteralPath $taskRoot -Force -Recurse -File | Measure-Object Length -Sum).Sum
+    # Cargo and tests remove temporary directories while this walk is in progress.
+    $bytes = Get-WorkspaceBytes $taskRoot
     if ($bytes -gt 750000000) {
         $compilerProcesses=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId)
         $ownedIds=[Collections.Generic.HashSet[int]]::new()

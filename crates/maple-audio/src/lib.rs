@@ -74,7 +74,7 @@ impl VoiceSession {
     pub fn speaking(&self) -> bool {
         self.active.load(Ordering::Relaxed)
     }
-    /// Local development room only; public deployments require authenticated encrypted media.
+    /// Capture and mix audio on a server-authorized, TLS-protected QUIC room.
     pub fn connect(
         connection: quinn::Connection,
         room: u32,

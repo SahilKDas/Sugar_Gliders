@@ -417,6 +417,16 @@ impl Painter {
             Theme::BARK,
             wf - 300.0,
         );
+        Self::rect(&mut p, wf - 135.0, 14.0, 115.0, 45.0, Theme::CRIMSON);
+        self.text(
+            &mut p,
+            "Sign out",
+            wf - 121.0,
+            43.0,
+            14.0,
+            Theme::CREAM,
+            90.0,
+        );
         self.text(
             &mut p,
             "A little warmth. A good conversation.",

@@ -83,3 +83,19 @@ impl Form {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn credentials_are_masked_bounded_and_removed_after_submission() {
+        let mut form = Form::default();
+        form.insert("Alice-_123");
+        assert_eq!(form.username, "alice_123");
+        form.field = 1;
+        form.insert("long private password");
+        assert!(matches!(form.command(), Some(Command::Login { .. })));
+        assert!(form.password.0.is_empty());
+        assert!(form.command().is_none());
+    }
+}

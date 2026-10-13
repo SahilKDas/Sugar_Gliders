@@ -45,6 +45,7 @@ struct App {
     auth: auth::Form,
     connection: Option<quinn::Connection>,
     runtime: Option<tokio::runtime::Handle>,
+    active_user: Option<String>,
 }
 const ROOMS: [&str; 3] = ["general", "introductions", "campfire"];
 const TRAIL_ROOMS: [&str; 3] = ["trail-chat", "trip-plans", "photos"];
@@ -82,6 +83,7 @@ impl App {
             auth: auth::Form::default(),
             connection: None,
             runtime: None,
+            active_user: None,
         })
     }
     fn select_room(&mut self, channel: String) {
@@ -210,12 +212,21 @@ impl ApplicationHandler for App {
             };
             match event {
                 Event::Authenticated { username, .. } => {
+                    if self.active_user.as_ref() != Some(&username) {
+                        self.messages.clear();
+                        self.groups.clear();
+                        self.members.clear();
+                        self.drafts.clear();
+                        self.draft.clear();
+                    }
+                    self.active_user = Some(username.clone());
                     self.authenticated = true;
                     self.auth.pending = false;
                     self.auth.username = username;
                     self.status = "Signed in • text and voice use TLS 1.3".into();
                 }
                 Event::SignedOut => {
+                    self.active_user = None;
                     self.authenticated = false;
                     self.voice = None;
                     self.groups.clear();
@@ -227,6 +238,7 @@ impl ApplicationHandler for App {
                     self.status = "Signed out".into();
                 }
                 Event::VoiceJoined(Some(room)) => {
+                    self.voice = None;
                     if let (Some(c), Some(runtime)) = (&self.connection, &self.runtime) {
                         match maple_audio::VoiceSession::connect(c.clone(), room, runtime) {
                             Ok(v) => {
@@ -325,9 +337,11 @@ impl ApplicationHandler for App {
                 self.cursor = (position.x / scale, position.y / scale);
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
-            WindowEvent::Ime(Ime::Commit(text)) if self.composer_focused && !self.about => {
+            WindowEvent::Ime(Ime::Commit(text)) if !self.about => {
                 if self.authenticated {
-                    self.insert_text(&text)
+                    if self.composer_focused {
+                        self.insert_text(&text)
+                    }
                 } else {
                     self.auth.insert(&text)
                 }
@@ -393,6 +407,10 @@ impl ApplicationHandler for App {
                 }
                 match control {
                     input::Control::About => self.about = true,
+                    input::Control::Logout => {
+                        self.voice = None;
+                        let _ = self.commands.try_send(Command::Logout);
+                    }
                     input::Control::League(index) => {
                         self.league = index;
                         let channels = if index == 0 { ROOMS } else { TRAIL_ROOMS };
@@ -563,7 +581,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(path) = std::env::args()
         .nth(1)
-        .filter(|s| s == "--render")
+        .filter(|s| s == "--render" || s == "--render-login")
         .and_then(|_| std::env::args().nth(2))
     {
         let painter = ui::Painter::new()?;
@@ -578,7 +596,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "You".into(),
             "Warm colors, native Rust, and a cozy place to chat.".into(),
         ));
-        let data = painter.draw(
+        let mut data = painter.draw(
             1100,
             760,
             "general",
@@ -593,6 +611,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             0,
             true,
         );
+        if std::env::args().nth(1).as_deref() == Some("--render-login") {
+            data = painter.sign_in(
+                data,
+                1100,
+                760,
+                &auth::Form::default(),
+                "Sign-in preview • real connections verify the server certificate",
+            );
+        }
         tiny_skia::Pixmap::from_vec(data, tiny_skia::IntSize::from_wh(1100, 760).unwrap())
             .unwrap()
             .save_png(path)?;
@@ -605,16 +632,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let name = std::env::args()
         .nth(1)
         .unwrap_or_else(|| format!("Guest-{}", std::process::id()));
-    let data_dir = std::env::var_os("MAPLE_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("LOCALAPPDATA")
-                .or_else(|| std::env::var_os("XDG_DATA_HOME"))
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir)
-                .join("Maple")
-        })
-        .join("secure-v2");
+    let data_dir = maple_server::data_directory();
     let network_dir = data_dir.clone();
     let backend_events = events.clone();
     runtime.spawn(async move {

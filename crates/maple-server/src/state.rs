@@ -16,6 +16,38 @@ pub const CHANNELS: [&str; 6] = [
     "photos",
 ];
 impl State {
+    pub fn validate(&self, names: &BTreeMap<String, String>) -> Result<(), maple_transport::Error> {
+        if self.groups.len() > 64 || self.history.len() > 70 {
+            return Err("Too many saved rooms".into());
+        }
+        for (id, g) in &self.groups {
+            if !valid_label(id)
+                || id != &g.id
+                || !(2..=10).contains(&g.members.len())
+                || g.members.iter().any(|id| !names.contains_key(id))
+            {
+                return Err("Invalid secure membership".into());
+            }
+        }
+        for (id, history) in &self.history {
+            if history.len() > 100
+                || (!CHANNELS.contains(&id.as_str()) && !self.groups.contains_key(id))
+            {
+                return Err("Invalid secure history".into());
+            }
+            for e in history {
+                match e {
+                    Event::Message {
+                        channel,
+                        author,
+                        text,
+                    } if channel == id && names.contains_key(author) && valid_text(text) => {}
+                    _ => return Err("Invalid secure message".into()),
+                }
+            }
+        }
+        Ok(())
+    }
     pub fn encode(&self) -> Result<Vec<u8>, maple_transport::Error> {
         let groups = self
             .groups

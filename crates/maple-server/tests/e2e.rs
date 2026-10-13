@@ -218,6 +218,14 @@ async fn secure_accounts_text_voice_and_certificates() {
             .await
             .is_err()
     );
+    // Consume the room-1 packet sent before Bob leaves. QUIC control streams and
+    // unreliable media have independent queues; a previously queued packet is not
+    // evidence that a new post-leave packet was forwarded.
+    let prior = tokio::time::timeout(Duration::from_secs(2), bob.connection.read_datagram())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(maple_audio::unpack(&prior).unwrap().2, 3);
     bob.send(Command::Voice { room: None }).await;
     bob.until(|e| matches!(e, Event::VoiceJoined(None))).await;
     alice
@@ -270,6 +278,16 @@ async fn secure_accounts_text_voice_and_certificates() {
         .unwrap();
     assert_ne!(id, "alice");
     assert!(hash.starts_with("$argon2id$"));
+    c.execute(
+        "UPDATE sessions SET expires=0 WHERE user_id=(SELECT id FROM users WHERE username='eve')",
+        [],
+    )
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), eve.connection.closed())
+            .await
+            .is_ok()
+    );
     let body: Vec<u8> = c
         .query_row("SELECT body FROM snapshots WHERE id=1", [], |r| r.get(0))
         .unwrap();
@@ -359,7 +377,15 @@ async fn wire_capture_and_tamper_rejection() {
     receiver
         .until(|e| matches!(e, Event::VoiceJoined(Some(1))))
         .await;
-    let marker = b"unique plaintext opus payload must never occur on wire";
+    let mut encoder =
+        opus::Encoder::new(48000, opus::Channels::Mono, opus::Application::Voip).unwrap();
+    let pcm: Vec<f32> = (0..maple_audio::FRAME)
+        .map(|i| (i as f32 * 0.0576).sin() * 0.15)
+        .collect();
+    let mut encoded = [0u8; 1275];
+    let length = encoder.encode_float(&pcm, &mut encoded).unwrap();
+    let marker = &encoded[..length];
+    assert!(marker.len() > 20);
     corrupt.store(true, Ordering::Relaxed);
     sender
         .connection
@@ -390,7 +416,7 @@ async fn wire_capture_and_tamper_rejection() {
     receiver.until(|e|matches!(e,Event::Message{text,..} if text=="unique confidential text marker for wire test")).await;
     for bytes in captures.lock().await.iter() {
         for secret in [
-            marker.as_slice(),
+            marker,
             b"unique confidential text marker for wire test",
             b"a sufficiently long test password".as_slice(),
         ] {
@@ -398,6 +424,39 @@ async fn wire_capture_and_tamper_rejection() {
         }
     }
     task.abort();
+    server.close(0u8.into(), b"Done");
+    server.wait_idle().await;
+}
+#[tokio::test]
+async fn account_authentication_throttle() {
+    let directory = std::env::current_dir()
+        .unwrap()
+        .join(format!("../../target/limit-test-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let _cleanup = Cleanup(directory.clone());
+    let server = maple_server::start(directory.clone(), "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let cert = std::fs::read(directory.join("server.der")).unwrap();
+    let mut client = Client::connect(server.local_addr().unwrap(), cert, "localhost")
+        .await
+        .unwrap();
+    for attempt in 0..9 {
+        client
+            .send(Command::Login {
+                username: "missing_user".into(),
+                password: Secret("invalid long test password".into()),
+            })
+            .await;
+        let response = client.until(|e| matches!(e, Event::Error(_))).await;
+        if let Event::Error(message) = response {
+            if attempt < 8 {
+                assert_eq!(message, "Invalid username or password");
+            } else {
+                assert!(message.contains("rate limit"));
+            }
+        }
+    }
     server.close(0u8.into(), b"Done");
     server.wait_idle().await;
 }
