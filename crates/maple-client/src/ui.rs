@@ -1,8 +1,8 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
 };
-use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Rect, Transform};
+use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Transform};
 pub struct Theme;
 impl Theme {
     pub const CREAM: u32 = 0xfdf8f0;
@@ -13,6 +13,9 @@ impl Theme {
 }
 type GlyphCache = HashMap<(char, u32), (fontdue::Metrics, Vec<u8>)>;
 pub struct Painter {
+    pub cursor: Cell<(f64, f64)>,
+    pub muted: Cell<bool>,
+    pub elapsed: Cell<f32>,
     font: fontdue::Font,
     glyphs: RefCell<GlyphCache>,
 }
@@ -29,6 +32,16 @@ impl Painter {
         p.fill(Self::color(Theme::CREAM));
         let left = w as f32 / 2.0 - 250.0;
         let top = h as f32 / 2.0 - 200.0;
+        for (x, y) in [
+            (90.0, 170.0),
+            (w as f32 - 85.0, 150.0),
+            (w as f32 - 125.0, h as f32 - 135.0),
+            (135.0, h as f32 - 110.0),
+        ] {
+            Self::leaf(&mut p, x, y, 0xecd8bd);
+        }
+        Self::rect(&mut p, left - 29.0, top - 32.0, 558.0, 445.0, 0xeadbc8);
+        Self::rect(&mut p, left - 32.0, top - 36.0, 564.0, 445.0, 0xffffff);
         Self::leaf(&mut p, 42.0, 43.0, Theme::AMBER);
         self.text(&mut p, "MAPLE", 65.0, 51.0, 23.0, Theme::CRIMSON, 180.0);
         self.text(
@@ -72,12 +85,20 @@ impl Painter {
         let username = format!(
             "{}{}",
             form.username,
-            if form.field == 0 { "|" } else { "" }
+            if form.field == 0 && self.caret_visible() {
+                "|"
+            } else {
+                ""
+            }
         );
         let password = format!(
             "{}{}",
             "•".repeat(form.password.0.chars().count().min(40)),
-            if form.field == 1 { "|" } else { "" }
+            if form.field == 1 && self.caret_visible() {
+                "|"
+            } else {
+                ""
+            }
         );
         self.text(
             &mut p,
@@ -97,11 +118,26 @@ impl Painter {
             Theme::BARK,
             470.0,
         );
-        Self::rect(&mut p, left, top + 235.0, 500.0, 45.0, Theme::AMBER);
+        Self::rect(
+            &mut p,
+            left,
+            top + 235.0,
+            500.0,
+            45.0,
+            if self.hovered(left, top + 235.0, 500.0, 45.0) {
+                Theme::CRIMSON
+            } else {
+                Theme::AMBER
+            },
+        );
         self.text(
             &mut p,
             if form.pending {
-                "Verifying…"
+                match (self.elapsed.get() * 3.0) as u32 % 3 {
+                    0 => "Verifying.",
+                    1 => "Verifying..",
+                    _ => "Verifying...",
+                }
             } else if form.register {
                 "Create account"
             } else {
@@ -146,13 +182,14 @@ impl Painter {
         );
         self.text(
             &mut p,
-            "F1: About & licenses · Tab: next field · Enter: submit",
+            "F1: About · F3: sounds · Tab: next field · Enter: submit",
             left,
             h as f32 - 24.0,
             12.0,
             Theme::BARK,
             500.0,
         );
+        self.sound_chip(&mut p);
         p.take()
     }
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
@@ -161,6 +198,9 @@ impl Painter {
             fontdue::FontSettings::default(),
         )?;
         Ok(Self {
+            cursor: Cell::new((-1.0, -1.0)),
+            muted: Cell::new(false),
+            elapsed: Cell::new(0.0),
             font,
             glyphs: RefCell::new(HashMap::new()),
         })
@@ -169,11 +209,67 @@ impl Painter {
         Color::from_rgba8((c >> 16) as u8, (c >> 8) as u8, c as u8, 255)
     }
     fn rect(p: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, c: u32) {
-        if let Some(r) = Rect::from_xywh(x, y, w, h) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let r = if w > 20.0 && h > 20.0 && w < p.width() as f32 - 50.0 {
+            9.0_f32.min(h / 2.0)
+        } else {
+            0.0
+        };
+        let mut path = PathBuilder::new();
+        path.move_to(x + r, y);
+        path.line_to(x + w - r, y);
+        path.quad_to(x + w, y, x + w, y + r);
+        path.line_to(x + w, y + h - r);
+        path.quad_to(x + w, y + h, x + w - r, y + h);
+        path.line_to(x + r, y + h);
+        path.quad_to(x, y + h, x, y + h - r);
+        path.line_to(x, y + r);
+        path.quad_to(x, y, x + r, y);
+        path.close();
+        if let Some(path) = path.finish() {
             let mut paint = Paint::default();
             paint.set_color(Self::color(c));
-            p.fill_rect(r, &paint, Transform::identity(), None);
+            p.fill_path(
+                &path,
+                &paint,
+                tiny_skia::FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
         }
+    }
+    fn caret_visible(&self) -> bool {
+        ((self.elapsed.get() * 2.0) as u32).is_multiple_of(2)
+    }
+    fn hovered(&self, x: f32, y: f32, w: f32, h: f32) -> bool {
+        let (cx, cy) = self.cursor.get();
+        cx >= x as f64 && cx < (x + w) as f64 && cy >= y as f64 && cy < (y + h) as f64
+    }
+    fn sound_chip(&self, p: &mut Pixmap) {
+        let y = p.height() as f32 - 58.0;
+        Self::rect(
+            p,
+            14.0,
+            y,
+            40.0,
+            40.0,
+            if self.hovered(14.0, y, 40.0, 40.0) {
+                Theme::AMBER
+            } else {
+                0x60463b
+            },
+        );
+        self.text(
+            p,
+            if self.muted.get() { "OFF" } else { "SFX" },
+            20.0,
+            y + 25.0,
+            11.0,
+            Theme::CREAM,
+            32.0,
+        );
     }
     fn circle(p: &mut Pixmap, x: f32, y: f32, r: f32, c: u32) {
         let mut paint = Paint::default();
@@ -331,8 +427,18 @@ impl Painter {
         .enumerate()
         {
             let y = 190.0 + i as f32 * 44.0;
-            if *name == room {
-                Self::rect(&mut p, 78.0, y, 174.0, 38.0, 0xecc9a6);
+            if *name == room || self.hovered(78.0, y, 174.0, 38.0) {
+                Self::rect(
+                    &mut p,
+                    78.0,
+                    y,
+                    174.0,
+                    38.0,
+                    if *name == room { 0xecc9a6 } else { 0xefddc7 },
+                );
+                if *name == room {
+                    Self::rect(&mut p, 78.0, y + 10.0, 3.0, 18.0, Theme::CRIMSON);
+                }
             }
             self.text(
                 &mut p,
@@ -351,7 +457,11 @@ impl Painter {
             382.0,
             174.0,
             44.0,
-            if voice { Theme::CRIMSON } else { Theme::AMBER },
+            if voice || self.hovered(78.0, 382.0, 174.0, 44.0) {
+                Theme::CRIMSON
+            } else {
+                Theme::AMBER
+            },
         );
         self.text(
             &mut p,
@@ -364,7 +474,7 @@ impl Painter {
         );
         self.text(
             &mut p,
-            "LOCAL DEVELOPMENT",
+            "COZY BY DESIGN",
             85.0,
             hf - 48.0,
             10.0,
@@ -401,7 +511,7 @@ impl Painter {
         }
         self.text(
             &mut p,
-            "Enter sends · Esc clears",
+            "Enter sends · F3 sounds",
             85.0,
             hf - 25.0,
             11.0,
@@ -453,7 +563,11 @@ impl Painter {
             &mut p,
             member_x + 34.0,
             158.0,
-            if speaking { 21.0 } else { 18.0 },
+            if speaking {
+                22.0 + (self.elapsed.get() * 5.0).sin() * 2.0
+            } else {
+                18.0
+            },
             if speaking { Theme::AMBER } else { Theme::GOLD },
         );
         Self::circle(&mut p, member_x + 34.0, 158.0, 15.0, Theme::CRIMSON);
@@ -502,7 +616,7 @@ impl Painter {
         for (channel, author, text) in messages {
             if channel == room {
                 lines.push((format!("{author}  •"), true));
-                for line in self.wrap(text, 15.0, content_width) {
+                for line in self.wrap(text, 15.0, content_width - 45.0) {
                     lines.push((line, false));
                 }
                 lines.push((String::new(), false));
@@ -532,10 +646,32 @@ impl Painter {
             );
         }
         for (i, (line, author)) in lines[start..end].iter().enumerate() {
+            let y = 121.0 + i as f32 * 23.0;
+            if *author {
+                Self::circle(&mut p, 296.0, y - 5.0, 11.0, Theme::CRIMSON);
+                self.text(
+                    &mut p,
+                    &line.chars().next().unwrap_or('M').to_string(),
+                    292.0,
+                    y - 1.0,
+                    11.0,
+                    Theme::CREAM,
+                    14.0,
+                );
+            } else if !line.is_empty() {
+                Self::rect(
+                    &mut p,
+                    313.0,
+                    y - 18.0,
+                    content_width - 28.0,
+                    24.0,
+                    0xf4e9da,
+                );
+            }
             self.text(
                 &mut p,
                 line,
-                285.0,
+                322.0,
                 121.0 + i as f32 * 23.0,
                 if *author { 13.0 } else { 15.0 },
                 if *author { Theme::CRIMSON } else { Theme::BARK },
@@ -551,7 +687,18 @@ impl Painter {
             if focused { Theme::AMBER } else { Theme::GOLD },
         );
         Self::rect(&mut p, 281.0, hf - 90.0, wf - 302.0, 46.0, 0xffffff);
-        Self::rect(&mut p, wf - 106.0, hf - 90.0, 85.0, 46.0, Theme::AMBER);
+        Self::rect(
+            &mut p,
+            wf - 106.0,
+            hf - 90.0,
+            85.0,
+            46.0,
+            if self.hovered(wf - 106.0, hf - 90.0, 85.0, 46.0) {
+                Theme::CRIMSON
+            } else {
+                Theme::AMBER
+            },
+        );
         self.text(
             &mut p,
             "Send",
@@ -575,12 +722,12 @@ impl Painter {
         let tail = &draft[start..];
         let shown = if draft.is_empty() {
             "Write a message…".to_string()
-        } else if focused {
+        } else if focused && self.caret_visible() {
             format!("{tail}|")
         } else {
             tail.to_string()
         };
-        if focused && draft.is_empty() {
+        if focused && draft.is_empty() && self.caret_visible() {
             Self::rect(&mut p, 294.0, hf - 78.0, 1.0, 22.0, Theme::AMBER);
         }
         self.text(
@@ -593,6 +740,7 @@ impl Painter {
             available,
         );
         self.text(&mut p, status, 282.0, hf - 17.0, 11.0, 0x806352, wf - 300.0);
+        self.sound_chip(&mut p);
         p.take()
     }
     pub fn about(&self, data: Vec<u8>, w: u32, h: u32, scroll: usize) -> Vec<u8> {

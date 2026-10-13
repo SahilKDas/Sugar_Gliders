@@ -1,3 +1,4 @@
+pub mod sfx;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::{
     collections::{BTreeMap, VecDeque},

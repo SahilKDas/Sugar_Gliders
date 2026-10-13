@@ -23,6 +23,19 @@ closes, another instance takes over and clients reconnect with a rotated in-memo
 session. An account can have multiple concurrent sessions. Use distinct accounts for
 a two-client chat/voice test.
 
+## Native polish and sounds
+
+Rounded parchment cards, avatar initials, selected-channel accents, hover feedback,
+blinking carets, and a gently pulsing speaking ring keep the native interface clear.
+UI animation pauses when the window loses focus. Warm synthesized chimes distinguish
+sending/receiving messages, sign-in/out, navigation, voice join/leave, errors, and
+sound toggles; typing adds a quiet short wooden tick. Sounds use output-only CPAL,
+precomputed samples, a bounded queue, and a 75 ms event throttle. Missing or unsupported
+output devices leave the app usable and silent. No sound assets or DLLs are shipped.
+
+Click **SFX** at the bottom left or press **F3** to mute/unmute all interface sounds.
+This preference persists locally and does not mute your voice conversation.
+
 ## Security behavior
 
 - Text/control uses reliable QUIC streams; voice uses unreliable QUIC DATAGRAM

@@ -3,6 +3,7 @@ mod auth;
 mod input;
 mod network;
 mod ui;
+use maple_audio::sfx::{Cue, Sounds};
 use maple_protocol::{Command, Event};
 use network::ClientEvent;
 use std::{
@@ -46,6 +47,11 @@ struct App {
     connection: Option<quinn::Connection>,
     runtime: Option<tokio::runtime::Handle>,
     active_user: Option<String>,
+    sounds: Option<Sounds>,
+    muted: bool,
+    last_sound: std::time::Instant,
+    started: std::time::Instant,
+    last_frame: std::time::Instant,
 }
 const ROOMS: [&str; 3] = ["general", "introductions", "campfire"];
 const TRAIL_ROOMS: [&str; 3] = ["trail-chat", "trip-plans", "photos"];
@@ -84,7 +90,34 @@ impl App {
             connection: None,
             runtime: None,
             active_user: None,
+            sounds: None,
+            muted: false,
+            last_sound: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            started: std::time::Instant::now(),
+            last_frame: std::time::Instant::now(),
         })
+    }
+    fn sound(&mut self, cue: Cue) {
+        if self.last_sound.elapsed() >= std::time::Duration::from_millis(75) {
+            if let Some(sounds) = &self.sounds {
+                sounds.play(cue);
+            }
+            self.last_sound = std::time::Instant::now();
+        }
+    }
+    fn toggle_sound(&mut self) {
+        self.muted = !self.muted;
+        self.ui.muted.set(self.muted);
+        if let Some(sounds) = &self.sounds {
+            sounds.set_muted(self.muted);
+        }
+        let path = maple_server::data_directory().join("sounds-muted");
+        if self.muted {
+            let _ = std::fs::write(path, b"muted");
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
+        self.sound(Cue::Toggle);
     }
     fn select_room(&mut self, channel: String) {
         if ROOMS.contains(&channel.as_str()) {
@@ -93,6 +126,7 @@ impl App {
             self.league = 1;
         }
         if channel != self.room {
+            self.sound(Cue::Navigate);
             self.drafts
                 .insert(self.room.clone(), std::mem::take(&mut self.draft));
             self.draft = self.drafts.remove(&channel).unwrap_or_default();
@@ -132,6 +166,7 @@ impl App {
         }
         match self.commands.try_send(command) {
             Ok(()) => {
+                self.sound(Cue::Send);
                 self.draft.clear();
                 self.scroll = 0;
             }
@@ -139,6 +174,9 @@ impl App {
         }
     }
     fn insert_text(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.sound(Cue::Type);
+        }
         for c in text.chars().filter(|c| !c.is_control()) {
             if self.draft.len() + c.len_utf8() > maple_protocol::MAX_TEXT {
                 break;
@@ -220,12 +258,14 @@ impl ApplicationHandler for App {
                         self.draft.clear();
                     }
                     self.active_user = Some(username.clone());
+                    self.sound(Cue::Welcome);
                     self.authenticated = true;
                     self.auth.pending = false;
                     self.auth.username = username;
                     self.status = "Signed in • text and voice use TLS 1.3".into();
                 }
                 Event::SignedOut => {
+                    self.sound(Cue::Goodbye);
                     self.active_user = None;
                     self.authenticated = false;
                     self.voice = None;
@@ -244,6 +284,7 @@ impl ApplicationHandler for App {
                             Ok(v) => {
                                 self.voice = Some(v);
                                 self.status = "Encrypted voice connected".into();
+                                self.sound(Cue::VoiceOn);
                             }
                             Err(e) => {
                                 self.status = format!("Audio: {e}");
@@ -255,18 +296,23 @@ impl ApplicationHandler for App {
                 Event::VoiceJoined(None) => {
                     self.voice = None;
                     self.status = "Voice disconnected".into();
+                    self.sound(Cue::VoiceOff);
                 }
                 Event::Message {
                     channel,
                     author,
                     text,
                 } => {
+                    if self.active_user.as_deref() != Some(author.as_str()) {
+                        self.sound(Cue::Receive);
+                    }
                     self.messages.push_back((channel, author, text));
                     if self.messages.len() > 500 {
                         self.messages.pop_front();
                     }
                 }
                 Event::Error(s) => {
+                    self.sound(Cue::Error);
                     self.status = s;
                     self.auth.pending = false;
                 }
@@ -312,6 +358,15 @@ impl ApplicationHandler for App {
         let speaking = self.voice.as_ref().is_some_and(|v| v.speaking());
         changed |= speaking != self.last_speaking;
         self.last_speaking = speaking;
+        let frame_interval = if speaking { 100 } else { 500 };
+        if !self.about
+            && self.window.as_ref().is_some_and(|w| w.has_focus())
+            && self.last_frame.elapsed() >= std::time::Duration::from_millis(frame_interval)
+        {
+            self.last_frame = std::time::Instant::now();
+            self.ui.elapsed.set(self.started.elapsed().as_secs_f32());
+            changed = true;
+        }
         if let Some(w) = self.window.as_ref().filter(|_| changed) {
             w.request_redraw();
         }
@@ -335,6 +390,25 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let scale = self.window.as_ref().map_or(1.0, |w| w.scale_factor());
                 self.cursor = (position.x / scale, position.y / scale);
+                if let Some(w) = &self.window {
+                    let size = w.inner_size().to_logical::<f64>(scale);
+                    let control = input::hit_test(
+                        self.cursor.0,
+                        self.cursor.1,
+                        size.width,
+                        size.height,
+                        self.groups.len(),
+                    );
+                    w.set_cursor(if control == input::Control::Composer {
+                        winit::window::CursorIcon::Text
+                    } else if control != input::Control::None || !self.authenticated {
+                        winit::window::CursorIcon::Pointer
+                    } else {
+                        winit::window::CursorIcon::Default
+                    });
+                    self.ui.cursor.set(self.cursor);
+                    w.request_redraw();
+                }
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Ime(Ime::Commit(text)) if !self.about => {
@@ -384,6 +458,13 @@ impl ApplicationHandler for App {
                     size.height,
                     self.groups.len(),
                 );
+                if control == input::Control::Sound {
+                    self.toggle_sound();
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
                 if self.about {
                     if control == input::Control::About {
                         self.about = false;
@@ -406,7 +487,11 @@ impl ApplicationHandler for App {
                     return;
                 }
                 match control {
-                    input::Control::About => self.about = true,
+                    input::Control::Sound => self.toggle_sound(),
+                    input::Control::About => {
+                        self.sound(Cue::Navigate);
+                        self.about = true;
+                    }
                     input::Control::Logout => {
                         self.voice = None;
                         let _ = self.commands.try_send(Command::Logout);
@@ -442,6 +527,13 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if event.logical_key == Key::Named(NamedKey::F3) {
+                    self.toggle_sound();
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
                 if !self.authenticated
                     && !self.about
                     && event.logical_key != Key::Named(NamedKey::F1)
@@ -657,6 +749,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     runtime.spawn(network::run(network_dir, receiver, events, room_watch));
     let mut app = App::new(commands, inbox, requested_room)?;
+    app.muted = maple_server::data_directory().join("sounds-muted").exists();
+    app.ui.muted.set(app.muted);
+    app.sounds = Some(Sounds::new(app.muted));
     app.runtime = Some(runtime.handle().clone());
     app.auth.username = if name.starts_with("Guest-") {
         String::new()

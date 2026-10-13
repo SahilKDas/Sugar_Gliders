@@ -1,5 +1,5 @@
 use maple_protocol::Command;
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Control {
     League(usize),
     Channel(usize),
@@ -9,9 +9,13 @@ pub enum Control {
     Send,
     About,
     Logout,
+    Sound,
     None,
 }
 pub fn hit_test(x: f64, y: f64, width: f64, height: f64, groups: usize) -> Control {
+    if (14.0..54.0).contains(&x) && (height - 58.0..height - 18.0).contains(&y) {
+        return Control::Sound;
+    }
     if (width - 135.0..width - 20.0).contains(&x) && (14.0..59.0).contains(&y) {
         return Control::Logout;
     }
@@ -70,6 +74,7 @@ mod tests {
     use super::*;
     #[test]
     fn controls_match_visible_layout() {
+        assert_eq!(hit_test(34.0, 722.0, 1100.0, 760.0, 2), Control::Sound);
         assert_eq!(hit_test(34.0, 110.0, 1100.0, 760.0, 2), Control::League(0));
         assert_eq!(hit_test(34.0, 154.0, 1100.0, 760.0, 2), Control::League(1));
         assert_eq!(
