@@ -1,0 +1,13 @@
+[package]
+name="maple-transport"
+version.workspace=true
+edition.workspace=true
+license.workspace=true
+[dependencies]
+quinn.workspace=true
+rustls.workspace=true
+tokio.workspace=true
+serde.workspace=true
+serde_json.workspace=true
+zeroize.workspace=true
+rcgen={version="0.13",default-features=false,features=["crypto","ring"]}

@@ -7,4 +7,6 @@ license.workspace = true
 [dependencies]
 cpal = "0.15"
 opus = "0.3"
+quinn.workspace=true
+tokio.workspace=true
 

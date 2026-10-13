@@ -1,13 +1,11 @@
 use maple_protocol::{valid_label, valid_text, Command, Event, Group};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct State {
     pub groups: BTreeMap<String, Group>,
     #[serde(skip)]
     pub online: BTreeSet<String>,
     pub history: BTreeMap<String, VecDeque<Event>>,
-    #[serde(skip)]
-    pub directory: std::path::PathBuf,
 }
 pub const CHANNELS: [&str; 6] = [
     "general",
@@ -18,53 +16,7 @@ pub const CHANNELS: [&str; 6] = [
     "photos",
 ];
 impl State {
-    pub fn load_from(
-        directory: &std::path::Path,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let path = directory.join("state.json");
-        if !path.exists() {
-            return Ok(Self {
-                directory: directory.to_owned(),
-                ..Self::default()
-            });
-        }
-        if path.metadata()?.len() > 64000000 {
-            return Err("State file exceeds 64 MB".into());
-        }
-        let mut state: Self = serde_json::from_slice(&std::fs::read(path)?)?;
-        state.directory = directory.to_owned();
-        if state.groups.len() > 64 || state.history.len() > 70 {
-            return Err("Too many saved chats".into());
-        }
-        for (id, g) in &state.groups {
-            if !valid_label(id)
-                || id != &g.id
-                || !(2..=10).contains(&g.members.len())
-                || g.members.iter().any(|m| !valid_label(m))
-            {
-                return Err("Invalid saved membership".into());
-            }
-        }
-        for (id, history) in &state.history {
-            if history.len() > 100
-                || (!CHANNELS.contains(&id.as_str()) && !state.groups.contains_key(id))
-            {
-                return Err("Invalid saved history".into());
-            }
-            for event in history {
-                match event {
-                    Event::Message {
-                        channel,
-                        author,
-                        text,
-                    } if channel == id && valid_label(author) && valid_text(text) => {}
-                    _ => return Err("Invalid saved message".into()),
-                }
-            }
-        }
-        Ok(state)
-    }
-    pub fn save(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn encode(&self) -> Result<Vec<u8>, maple_transport::Error> {
         let groups = self
             .groups
             .iter()
@@ -77,28 +29,11 @@ impl State {
             .filter(|(id, _)| CHANNELS.contains(&id.as_str()) || groups.contains_key(*id))
             .map(|(id, h)| (id.clone(), h.clone()))
             .collect();
-        let snapshot = Self {
+        Ok(serde_json::to_vec(&Self {
             groups,
             history,
             online: BTreeSet::new(),
-            directory: std::path::PathBuf::new(),
-        };
-        let bytes = serde_json::to_vec(&snapshot)?;
-        if bytes.len() > 64000000 {
-            return Err("Persistent state exceeds 64 MB".into());
-        }
-        std::fs::create_dir_all(&self.directory)?;
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(self.directory.join("state.tmp"))?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-        }
-        std::fs::rename(
-            self.directory.join("state.tmp"),
-            self.directory.join("state.json"),
-        )?;
-        Ok(())
+        })?)
     }
     pub fn allowed(&self, name: &str, channel: &str) -> bool {
         CHANNELS.contains(&channel)
@@ -225,7 +160,7 @@ impl State {
                 }
                 Ok(vec![Event::Joined(room.clone())])
             }
-            Command::Hello { .. } => Err("Already introduced".into()),
+            _ => Err("This command requires session handling".into()),
         }
     }
     pub fn disconnect(&mut self, name: &str) {

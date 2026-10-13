@@ -51,6 +51,7 @@ pub fn parse(text: &str, room: &str) -> Result<Command, String> {
     }
     let parts: Vec<_> = text.split_whitespace().collect();
     match parts.as_slice(){
+        ["/logout"]=>Ok(Command::Logout),
         ["/join",channel]=>Ok(Command::Join{channel:(*channel).into()}),
         ["/dm",id,member]=>Ok(Command::CreateGroup{id:(*id).into(),members:vec![(*member).into()],persistent:true}),
         [verb,id,members] if *verb=="/group"||*verb=="/ephemeral"=>Ok(Command::CreateGroup{id:(*id).into(),members:members.split(',').map(str::to_owned).collect(),persistent:*verb=="/group"}),

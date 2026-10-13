@@ -96,8 +96,21 @@ pub fn leagues() -> Vec<League> {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Command {
-    Hello {
-        name: String,
+    Ping,
+    Register {
+        username: String,
+        password: Secret,
+    },
+    Login {
+        username: String,
+        password: Secret,
+    },
+    Resume {
+        token: Secret,
+    },
+    Logout,
+    Voice {
+        room: Option<u32>,
     },
     Send {
         channel: String,
@@ -124,6 +137,13 @@ pub enum Command {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Event {
+    Pong,
+    Authenticated {
+        username: String,
+        token: Secret,
+    },
+    SignedOut,
+    VoiceJoined(Option<u32>),
     Groups(Vec<Group>),
     Joined(String),
     History {
@@ -141,11 +161,26 @@ pub enum Event {
     },
     Error(String),
 }
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Secret(pub String);
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+impl Drop for Secret {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.zeroize();
+    }
+}
 pub fn valid_label(s: &str) -> bool {
     !s.trim().is_empty() && s.len() <= 64 && !s.chars().any(char::is_control)
 }
 pub fn valid_text(s: &str) -> bool {
-    !s.trim().is_empty() && s.len() <= MAX_TEXT
+    !s.trim().is_empty()
+        && s.len() <= MAX_TEXT
+        && s.chars().all(|c| !c.is_control() || c == '\n' || c == '\t')
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+mod auth;
 mod input;
 mod network;
 mod ui;
@@ -40,6 +41,10 @@ struct App {
     modifiers: ModifiersState,
     about: bool,
     about_scroll: usize,
+    authenticated: bool,
+    auth: auth::Form,
+    connection: Option<quinn::Connection>,
+    runtime: Option<tokio::runtime::Handle>,
 }
 const ROOMS: [&str; 3] = ["general", "introductions", "campfire"];
 const TRAIL_ROOMS: [&str; 3] = ["trail-chat", "trip-plans", "photos"];
@@ -73,6 +78,10 @@ impl App {
             modifiers: ModifiersState::empty(),
             about: false,
             about_scroll: 0,
+            authenticated: false,
+            auth: auth::Form::default(),
+            connection: None,
+            runtime: None,
         })
     }
     fn select_room(&mut self, channel: String) {
@@ -91,7 +100,7 @@ impl App {
         self.composer_focused = true;
         self.members.clear();
         let _ = self.requested_room.send(channel.clone());
-        if self.connected {
+        if self.connected && self.authenticated {
             if self.commands.try_send(Command::Join { channel }).is_err() {
                 self.status = "Backend busy • channel selected; draft retained".into();
             }
@@ -103,7 +112,7 @@ impl App {
         if !maple_protocol::valid_text(&self.draft) {
             return;
         }
-        if !self.connected {
+        if !self.connected || !self.authenticated {
             self.status = "Offline • reconnecting; your draft is retained".into();
             return;
         }
@@ -133,6 +142,20 @@ impl App {
                 break;
             }
             self.draft.push(c);
+        }
+    }
+    fn sign_in(&mut self) {
+        if !self.connected {
+            self.status = "Waiting for verified encrypted connection".into();
+            return;
+        }
+        if let Some(c) = self.auth.command() {
+            if self.commands.try_send(c).is_err() {
+                self.auth.pending = false;
+                self.status = "Sign-in unavailable; try again".into();
+            } else {
+                self.status = "Verifying account…".into();
+            }
         }
     }
 }
@@ -168,16 +191,59 @@ impl ApplicationHandler for App {
             changed = true;
             let event = match event {
                 ClientEvent::Wire(e) => e,
+                ClientEvent::Ready(c) => {
+                    self.connection = Some(c);
+                    continue;
+                }
                 ClientEvent::Connection(connected, status) => {
                     self.connected = connected;
                     self.status = status;
                     if !connected {
+                        self.authenticated = false;
+                        self.auth.pending = false;
+                        self.voice = None;
+                        self.connection = None;
                         self.members.clear();
                     }
                     continue;
                 }
             };
             match event {
+                Event::Authenticated { username, .. } => {
+                    self.authenticated = true;
+                    self.auth.pending = false;
+                    self.auth.username = username;
+                    self.status = "Signed in • text and voice use TLS 1.3".into();
+                }
+                Event::SignedOut => {
+                    self.authenticated = false;
+                    self.voice = None;
+                    self.groups.clear();
+                    self.members.clear();
+                    self.messages.clear();
+                    self.drafts.clear();
+                    self.draft.clear();
+                    self.auth.pending = false;
+                    self.status = "Signed out".into();
+                }
+                Event::VoiceJoined(Some(room)) => {
+                    if let (Some(c), Some(runtime)) = (&self.connection, &self.runtime) {
+                        match maple_audio::VoiceSession::connect(c.clone(), room, runtime) {
+                            Ok(v) => {
+                                self.voice = Some(v);
+                                self.status = "Encrypted voice connected".into();
+                            }
+                            Err(e) => {
+                                self.status = format!("Audio: {e}");
+                                let _ = self.commands.try_send(Command::Voice { room: None });
+                            }
+                        }
+                    }
+                }
+                Event::VoiceJoined(None) => {
+                    self.voice = None;
+                    self.status = "Voice disconnected".into();
+                }
                 Event::Message {
                     channel,
                     author,
@@ -188,7 +254,10 @@ impl ApplicationHandler for App {
                         self.messages.pop_front();
                     }
                 }
-                Event::Error(s) => self.status = s,
+                Event::Error(s) => {
+                    self.status = s;
+                    self.auth.pending = false;
+                }
                 Event::Groups(groups) => {
                     self.groups = groups;
                     if !ROOMS.contains(&self.room.as_str())
@@ -257,7 +326,11 @@ impl ApplicationHandler for App {
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Ime(Ime::Commit(text)) if self.composer_focused && !self.about => {
-                self.insert_text(&text)
+                if self.authenticated {
+                    self.insert_text(&text)
+                } else {
+                    self.auth.insert(&text)
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let y = match delta {
@@ -306,6 +379,18 @@ impl ApplicationHandler for App {
                     }
                     return;
                 }
+                if !self.authenticated && control != input::Control::About {
+                    if self
+                        .auth
+                        .click(self.cursor.0, self.cursor.1, size.width, size.height)
+                    {
+                        self.sign_in();
+                    }
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
                 match control {
                     input::Control::About => self.about = true,
                     input::Control::League(index) => {
@@ -328,28 +413,42 @@ impl ApplicationHandler for App {
                         if !self.connected {
                             self.status = "Voice requires a connection to the local backend".into();
                         } else {
-                            if self.voice.is_some() {
-                                self.voice = None;
-                                self.status = "Voice disconnected".into();
+                            let room = if self.voice.is_some() {
+                                None
                             } else {
-                                match maple_audio::VoiceSession::connect(
-                                    "127.0.0.1:8788",
-                                    self.league as u32 + 1,
-                                ) {
-                                    Ok(v) => {
-                                        self.voice = Some(v);
-                                        self.status =
-                                            "Voice connected • local Autumn Lounge".into();
-                                    }
-                                    Err(e) => self.status = format!("Voice: {e}"),
-                                }
-                            }
+                                Some(self.league as u32 + 1)
+                            };
+                            let _ = self.commands.try_send(Command::Voice { room });
                         }
                     }
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if !self.authenticated
+                    && !self.about
+                    && event.logical_key != Key::Named(NamedKey::F1)
+                {
+                    match event.logical_key {
+                        Key::Named(NamedKey::Tab) => self.auth.field = 1 - self.auth.field,
+                        Key::Named(NamedKey::Enter) => self.sign_in(),
+                        Key::Named(NamedKey::Backspace) => self.auth.backspace(),
+                        Key::Character(s)
+                            if !self.modifiers.control_key() && !self.modifiers.super_key() =>
+                        {
+                            self.auth.insert(event.text.as_deref().unwrap_or(&s))
+                        }
+                        _ => {}
+                    }
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                    return;
+                }
                 match event.logical_key {
+                    Key::Named(NamedKey::F2) if self.authenticated => {
+                        self.voice = None;
+                        let _ = self.commands.try_send(Command::Logout);
+                    }
                     Key::Named(NamedKey::F1) => {
                         self.about = !self.about;
                         self.about_scroll = 0;
@@ -405,6 +504,14 @@ impl ApplicationHandler for App {
                     pixels =
                         self.ui
                             .about(pixels, logical.width, logical.height, self.about_scroll);
+                } else if !self.authenticated {
+                    pixels = self.ui.sign_in(
+                        pixels,
+                        logical.width,
+                        logical.height,
+                        &self.auth,
+                        &self.status,
+                    );
                 }
                 if logical.width != size.width || logical.height != size.height {
                     let image = tiny_skia::Pixmap::from_vec(
@@ -506,7 +613,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir)
                 .join("Maple")
-        });
+        })
+        .join("secure-v2");
+    let network_dir = data_dir.clone();
     let backend_events = events.clone();
     runtime.spawn(async move {
         loop {
@@ -528,8 +637,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     });
-    runtime.spawn(network::run(name, receiver, events, room_watch));
+    runtime.spawn(network::run(network_dir, receiver, events, room_watch));
     let mut app = App::new(commands, inbox, requested_room)?;
+    app.runtime = Some(runtime.handle().clone());
+    app.auth.username = if name.starts_with("Guest-") {
+        String::new()
+    } else {
+        name.to_ascii_lowercase()
+    };
     EventLoop::new()?.run_app(&mut app)?;
     Ok(())
 }
@@ -554,6 +669,7 @@ mod tests {
         app.select_room("general".into());
         assert_eq!(app.draft, "Hello maple 🍁");
         app.connected = true;
+        app.authenticated = true;
         app.submit();
         assert!(
             matches!(rx.try_recv().unwrap(),Command::Send{channel,text} if channel=="general"&&text=="Hello maple 🍁")

@@ -7,9 +7,15 @@ license.workspace = true
 [dependencies]
 maple-protocol.workspace = true
 maple-audio.workspace = true
+maple-transport.workspace=true
+quinn.workspace=true
+zeroize.workspace=true
+argon2="0.5"
+rand="0.8"
+sha2="0.10"
+rusqlite={version="0.32",features=["bundled"]}
 tokio.workspace = true
-tokio-tungstenite.workspace = true
-futures-util.workspace = true
 serde_json.workspace = true
 serde.workspace = true
+
 

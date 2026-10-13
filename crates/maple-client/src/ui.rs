@@ -17,6 +17,144 @@ pub struct Painter {
     glyphs: RefCell<GlyphCache>,
 }
 impl Painter {
+    pub fn sign_in(
+        &self,
+        data: Vec<u8>,
+        w: u32,
+        h: u32,
+        form: &crate::auth::Form,
+        status: &str,
+    ) -> Vec<u8> {
+        let mut p = Pixmap::from_vec(data, tiny_skia::IntSize::from_wh(w, h).unwrap()).unwrap();
+        p.fill(Self::color(Theme::CREAM));
+        let left = w as f32 / 2.0 - 250.0;
+        let top = h as f32 / 2.0 - 200.0;
+        Self::leaf(&mut p, 42.0, 43.0, Theme::AMBER);
+        self.text(&mut p, "MAPLE", 65.0, 51.0, 23.0, Theme::CRIMSON, 180.0);
+        self.text(
+            &mut p,
+            if form.register {
+                "Create your Maple account"
+            } else {
+                "Sign in to Maple"
+            },
+            left,
+            top + 22.0,
+            25.0,
+            Theme::CRIMSON,
+            500.0,
+        );
+        self.text(
+            &mut p,
+            "Accounts are local to this server. Text and voice use TLS 1.3.",
+            left,
+            top + 54.0,
+            13.0,
+            Theme::BARK,
+            500.0,
+        );
+        for (index, y, label) in [(0, top + 90.0, "Username"), (1, top + 160.0, "Password")] {
+            self.text(&mut p, label, left, y - 8.0, 13.0, Theme::BARK, 500.0);
+            Self::rect(
+                &mut p,
+                left,
+                y,
+                500.0,
+                48.0,
+                if form.field == index {
+                    Theme::AMBER
+                } else {
+                    Theme::GOLD
+                },
+            );
+            Self::rect(&mut p, left + 1.0, y + 1.0, 498.0, 46.0, 0xffffff);
+        }
+        let username = format!(
+            "{}{}",
+            form.username,
+            if form.field == 0 { "|" } else { "" }
+        );
+        let password = format!(
+            "{}{}",
+            "•".repeat(form.password.0.chars().count().min(40)),
+            if form.field == 1 { "|" } else { "" }
+        );
+        self.text(
+            &mut p,
+            &username,
+            left + 14.0,
+            top + 121.0,
+            16.0,
+            Theme::BARK,
+            470.0,
+        );
+        self.text(
+            &mut p,
+            &password,
+            left + 14.0,
+            top + 191.0,
+            16.0,
+            Theme::BARK,
+            470.0,
+        );
+        Self::rect(&mut p, left, top + 235.0, 500.0, 45.0, Theme::AMBER);
+        self.text(
+            &mut p,
+            if form.pending {
+                "Verifying…"
+            } else if form.register {
+                "Create account"
+            } else {
+                "Sign in"
+            },
+            left + 18.0,
+            top + 264.0,
+            16.0,
+            Theme::CREAM,
+            460.0,
+        );
+        self.text(
+            &mut p,
+            if form.register {
+                "Already have an account? Sign in"
+            } else {
+                "New here? Create an account"
+            },
+            left,
+            top + 319.0,
+            15.0,
+            Theme::CRIMSON,
+            500.0,
+        );
+        self.text(
+            &mut p,
+            "Username: lowercase letters/digits/_ · Password: 12+ characters",
+            left,
+            top + 351.0,
+            12.0,
+            Theme::BARK,
+            500.0,
+        );
+        self.text(
+            &mut p,
+            status,
+            left,
+            top + 383.0,
+            13.0,
+            Theme::CRIMSON,
+            500.0,
+        );
+        self.text(
+            &mut p,
+            "F1: About & licenses · Tab: next field · Enter: submit",
+            left,
+            h as f32 - 24.0,
+            12.0,
+            Theme::BARK,
+            500.0,
+        );
+        p.take()
+    }
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let font = fontdue::Font::from_bytes(
             &include_bytes!("../../../assets/fonts/NotoSans-Regular.ttf")[..],
@@ -471,7 +609,7 @@ impl Painter {
             Theme::BARK,
             wf - 140.0,
         );
-        let text=format!("Maple {}\nNative Rust UI, embedded local server, statically linked Opus.\nAuthentication and transport encryption are planned, not enabled.\n\n{}\n\nApplication source license:\n{}",env!("CARGO_PKG_VERSION"),include_str!("../../../assets/fonts/OFL.txt"),include_str!("../../../LICENSE"));
+        let text=format!("Maple {}\nNative Rust UI, embedded server, statically linked Opus.\nArgon2id accounts and certificate-verified TLS 1.3 QUIC text/voice.\nF2 signs out. Encryption protects traffic to the server (not E2EE).\n\n{}\n\nApplication source license:\n{}",env!("CARGO_PKG_VERSION"),include_str!("../../../assets/fonts/OFL.txt"),include_str!("../../../LICENSE"));
         let lines = self.wrap(&text, 13.0, wf - 145.0);
         let capacity = ((hf - 135.0) / 20.0).max(1.0) as usize;
         let start = scroll.min(lines.len().saturating_sub(capacity));

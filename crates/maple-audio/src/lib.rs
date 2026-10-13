@@ -1,7 +1,6 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::{
     collections::{BTreeMap, VecDeque},
-    net::UdpSocket,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
@@ -69,17 +68,21 @@ pub struct VoiceSession {
     input: Option<cpal::Stream>,
     output: Option<cpal::Stream>,
     worker: Option<thread::JoinHandle<()>>,
+    receiver: tokio::task::JoinHandle<()>,
 }
 impl VoiceSession {
     pub fn speaking(&self) -> bool {
         self.active.load(Ordering::Relaxed)
     }
     /// Local development room only; public deployments require authenticated encrypted media.
-    pub fn connect(peer: &str, room: u32) -> Result<Self, Box<dyn std::error::Error>> {
-        let socket = UdpSocket::bind("127.0.0.1:0")?;
-        socket.connect(peer)?;
-        socket.set_nonblocking(true)?;
-        let stream_id = socket.local_addr()?.port() as u32;
+    pub fn connect(
+        connection: quinn::Connection,
+        room: u32,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if connection.max_datagram_size().is_none() {
+            return Err("Encrypted voice datagrams unavailable".into());
+        }
         let host = cpal::default_host();
         let input_device = host.default_input_device().ok_or("No microphone")?;
         let output_device = host.default_output_device().ok_or("No speaker")?;
@@ -146,26 +149,38 @@ impl VoiceSession {
         output.play()?;
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
+        let (media_tx, media_rx) = mpsc::sync_channel::<Vec<u8>>(32);
+        let receiving = connection.clone();
+        let receiver = runtime.spawn(async move {
+            while let Ok(bytes) = receiving.read_datagram().await {
+                let _ = media_tx.try_send(bytes.to_vec());
+            }
+        });
         let worker = thread::spawn(move || {
             let mut seq = 0u16;
             let mut bytes = [0u8; 1275];
-            let mut incoming = [0u8; 1290];
             let mut pcm = [0f32; FRAME];
             let mut speakers: BTreeMap<u32, Speaker> = BTreeMap::new();
             let mut tick = Instant::now() + Duration::from_millis(20);
             while !stopping.load(Ordering::Relaxed) {
                 while let Ok(frame) = rx.try_recv() {
                     if let Ok(n) = encoder.encode_float(&frame, &mut bytes) {
-                        let _ = socket.send(&packet(room, stream_id, seq, &bytes[..n]));
+                        let bytes = packet(room, 0, seq, &bytes[..n]);
+                        if connection
+                            .max_datagram_size()
+                            .is_some_and(|max| bytes.len() <= max)
+                        {
+                            let _ = connection.send_datagram(bytes.into());
+                        }
                         seq = seq.wrapping_add(1);
                     }
                 }
                 // Bound the receive batch so a packet flood cannot starve shutdown or playback.
                 for _ in 0..64 {
-                    let Ok(n) = socket.recv(&mut incoming) else {
+                    let Ok(incoming) = media_rx.try_recv() else {
                         break;
                     };
-                    if let Some((incoming_room, id, seq, payload)) = unpack(&incoming[..n]) {
+                    if let Some((incoming_room, id, seq, payload)) = unpack(&incoming) {
                         if incoming_room != room {
                             continue;
                         }
@@ -222,12 +237,14 @@ impl VoiceSession {
             input: Some(input),
             output: Some(output),
             worker: Some(worker),
+            receiver,
         })
     }
 }
 impl Drop for VoiceSession {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.receiver.abort();
         self.input.take();
         self.output.take();
         if let Some(worker) = self.worker.take() {
